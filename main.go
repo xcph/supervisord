@@ -50,7 +50,8 @@ func initSignals(s *Supervisor) {
 		sig := <-sigs
 		log.WithFields(log.Fields{"signal": sig}).Info("receive a signal to stop all process & exit")
 		s.procMgr.StopAllProcesses()
-		os.Exit(-1)
+		// Exit 0 so Kubernetes reports pod as Completed/Terminated, not Error, during deletion
+		os.Exit(0)
 	}()
 
 }
@@ -165,7 +166,15 @@ func getSupervisordLogFile(configFile string) string {
 }
 
 func main() {
-	if BuildVersion != "" { VERSION = BuildVersion }
+	if BuildVersion != "" {
+		VERSION = BuildVersion
+	}
+	if handleRunContainer() {
+		return
+	}
+	if handleExecInNs() {
+		return
+	}
 	ReapZombie()
 
 	// when execute `supervisord` without sub-command, it should start the server

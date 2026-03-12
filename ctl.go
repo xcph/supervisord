@@ -56,6 +56,10 @@ type SignalCommand struct {
 type LogtailCommand struct {
 }
 
+// ExecCommand enter program's namespace and run shell or command
+type ExecCommand struct {
+}
+
 // CmdCheckWrapperCommand A wrapper can be used to check whether
 // number of parameters is valid or not
 type CmdCheckWrapperCommand struct {
@@ -78,6 +82,7 @@ var reloadCommand = CmdCheckWrapperCommand{&ReloadCommand{}, 0, ""}
 var pidCommand = CmdCheckWrapperCommand{&PidCommand{}, 1, "pid <program>"}
 var signalCommand = CmdCheckWrapperCommand{&SignalCommand{}, 2, "signal <signal_name> <program>[...]"}
 var logtailCommand = CmdCheckWrapperCommand{&LogtailCommand{}, 1, "logtail <program>"}
+var execCommand = CmdCheckWrapperCommand{&ExecCommand{}, 1, "exec <program> [command...]"}
 
 func (x *CtlCommand) getServerURL() string {
 	options.Configuration, _ = findSupervisordConf()
@@ -305,6 +310,37 @@ func (x *CtlCommand) getPid(rpcc *xmlrpcclient.XMLRPCClient, process string) {
 	}
 }
 
+// exec enters the program's PID and mount namespace, then runs a command or interactive shell.
+// Usage: exec <program> [command...]
+// If no command is given, starts an interactive bash (or $SHELL).
+// Uses pure Go implementation (no external nsenter dependency).
+func (x *CtlCommand) exec(rpcc *xmlrpcclient.XMLRPCClient, args []string) {
+	program := args[0]
+	procInfo, err := rpcc.GetProcessInfo(program)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "program '%s' not found\n", program)
+		os.Exit(1)
+	}
+	if procInfo.Pid == 0 {
+		fmt.Fprintf(os.Stderr, "program '%s' is not running (pid=0)\n", program)
+		os.Exit(1)
+	}
+	var cmdArgs []string
+	if len(args) == 1 {
+		shell := os.Getenv("SHELL")
+		if shell == "" {
+			shell = "/bin/bash"
+		}
+		cmdArgs = []string{shell}
+	} else {
+		cmdArgs = args[1:]
+	}
+	if err := runExecInNamespace(procInfo.Pid, cmdArgs, os.Stdin, os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func (x *CtlCommand) getProcessInfo(rpcc *xmlrpcclient.XMLRPCClient, process string) (types.ProcessInfo, error) {
 	return rpcc.GetProcessInfo(process)
 }
@@ -420,6 +456,12 @@ func (pc *PidCommand) Execute(args []string) error {
 	return nil
 }
 
+// Execute enter program's namespace and run shell or command
+func (ec *ExecCommand) Execute(args []string) error {
+	ctlCommand.exec(ctlCommand.createRPCClient(), args)
+	return nil
+}
+
 // Execute tail the stdout/stderr of a program through http interface
 func (lc *LogtailCommand) Execute(args []string) error {
 	program := args[0]
@@ -512,5 +554,9 @@ func init() {
 		"get the standard output&standard error of the program",
 		"get the standard output&standard error of the program",
 		&logtailCommand)
+	ctlCmd.AddCommand("exec",
+		"enter program's namespace and run shell or command",
+		"Enter the program's PID/mount namespace. Run interactive bash if no command given, otherwise run the specified command.",
+		&execCommand)
 
 }

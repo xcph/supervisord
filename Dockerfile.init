@@ -1,0 +1,15 @@
+# Dockerfile.init builds an image for the init container that copies supervisord
+# and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
+FROM golang:1.26.1 AS builder
+RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends git gcc && rm -rf /var/lib/apt/lists/*
+COPY . /src
+WORKDIR /src
+
+ENV GOPROXY=https://goproxy.cn,direct
+RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord
+
+FROM alpine:3.19
+COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
+COPY scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
+RUN chmod +x /init-copy-supervisord.sh
+ENTRYPOINT ["/init-copy-supervisord.sh"]

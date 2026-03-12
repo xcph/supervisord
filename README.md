@@ -8,6 +8,18 @@ But this tool requires that the big python environment be installed in target sy
 
 This project re-implements supervisord in go-lang. Compiled supervisord is very suitable for environments where python is not installed.
 
+# Dockerfile.init for cloudphone-operator
+
+When using supervisord with cloudphone-operator (init container + emptyDir), you **must** build the image from `Dockerfile.init`, NOT the default `Dockerfile`:
+
+```bash
+docker build -f Dockerfile.init -t your-registry/supervisord:v0.0.1 .
+docker push your-registry/supervisord:v0.0.1
+```
+
+- **Dockerfile** produces a minimal scratch image (supervisord only) - cannot be used as init container
+- **Dockerfile.init** produces an alpine image with supervisord + init script - required for init container
+
 # Building the supervisord
 
 Before compiling the supervisord, make sure the go-lang 1.11+ is installed in your environment.

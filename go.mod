@@ -24,6 +24,7 @@ require (
 	github.com/ochinchina/supervisord/xmlrpcclient v0.0.0-20250610055946-d5a5470d11af
 	github.com/prometheus/client_golang v1.22.0
 	github.com/sirupsen/logrus v1.9.3
+	golang.org/x/sys v0.33.0
 	google.golang.org/protobuf v1.36.6 // indirect; CVE-2024-24786
 )
 
@@ -40,7 +41,6 @@ require (
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/rogpeppe/go-charset v0.0.0-20190617161244-0dc95cdf6f31 // indirect
-	golang.org/x/sys v0.33.0 // indirect
 )
 
 replace (

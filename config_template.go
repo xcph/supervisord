@@ -49,6 +49,12 @@ stopsignal=TERM
 stopwaitsecs=10
 stopasgroup=true
 killasgroup=true
+# Run process in isolated container (runc-like, Linux only). When true, forks with
+# CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_NEWUTS|CLONE_NEWIPC, mounts fresh /proc,
+# sets up cpuset for Android. Network ns excluded by default (redroid netd needs iptables).
+container_run=false
+# When true, also use CLONE_NEWNET. Breaks redroid netd/iptables; only for full isolation.
+container_network_isolated=false
 user=user1
 redirect_stderr=false
 stdout_logfile=AUTO
@@ -88,6 +94,8 @@ stopsignal=TERM
 stopwaitsecs=10
 #stopasgroup=not support
 #killasgroup=not support
+#container_run=not support
+#container_network_isolated=not support
 user=user1
 redirect_stderr=false
 stdout_logfile=AUTO

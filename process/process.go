@@ -414,6 +414,10 @@ func (p *Process) createProgramCommand() error {
 	if err != nil {
 		return err
 	}
+	programPath := args[0]
+	if p.config.GetBool("container_run", false) {
+		args = createContainerRunWrapper(args)
+	}
 	p.cmd, err = createCommand(args)
 	if err != nil {
 		return err
@@ -422,8 +426,9 @@ func (p *Process) createProgramCommand() error {
 		log.WithFields(log.Fields{"user": p.config.GetString("user", "")}).Error("fail to run as user")
 		return fmt.Errorf("fail to set user")
 	}
-	p.setProgramRestartChangeMonitor(args[0])
+	p.setProgramRestartChangeMonitor(programPath)
 	setDeathsig(p.cmd.SysProcAttr)
+	setContainerRun(p.cmd.SysProcAttr, p.config)
 	p.setEnv()
 	p.setDir()
 	p.setLog()
@@ -583,6 +588,10 @@ func (p *Process) run(finishCb func()) {
 			break
 		}
 
+		// Before fork: join foreground cpuset so child (init) inherits. Fixes redroid ENOSPC.
+		if p.config.GetBool("container_run", false) {
+			joinForegroundCpusetBeforeFork()
+		}
 		err = p.cmd.Start()
 
 		if err != nil {
