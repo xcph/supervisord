@@ -10,16 +10,13 @@ mkdir -p "$SHARED"
 cp -f /usr/local/bin/supervisord "$SHARED/supervisord"
 chmod +x "$SHARED/supervisord"
 
-# Copy static busybox for setup-shell (redroid has no /bin/sh; kubectl exec -- sh needs it)
+# Copy static busybox for /bin/sh (redroid has no /bin/sh; kubectl exec -- sh needs it; works before init)
 HAS_BUSYBOX=0
-for bb in /bin/busybox /usr/bin/busybox; do
-  if [ -f "$bb" ]; then
-    cp -f "$bb" "$SHARED/busybox"
-    chmod +x "$SHARED/busybox"
-    HAS_BUSYBOX=1
-    break
-  fi
-done
+if [ -f /usr/local/bin/busybox ]; then
+  cp -f /usr/local/bin/busybox "$SHARED/busybox"
+  chmod +x "$SHARED/busybox"
+  HAS_BUSYBOX=1
+fi
 
 # Write supervisord.conf
 # - nodaemon: run in foreground for container
@@ -44,9 +41,9 @@ CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
   echo 'serverurl=http://127.0.0.1:9001'
   echo ''
   if [ "$HAS_BUSYBOX" = 1 ]; then
-    echo '# Create /bin/sh symlink so kubectl exec -- sh works (redroid has no /bin/sh)'
-    echo '[program:setup-shell]'
-    echo 'command=/shared/busybox sh -c "mkdir -p /bin && ln -sf /system/bin/sh /bin/sh"'
+    echo '# Install busybox to /system/busybox; PATH in Pod env and program-default'
+    echo '[program:setup-dir]'
+    echo 'command=/shared/busybox mkdir -p /system/busybox'
     echo 'autostart=true'
     echo 'autorestart=false'
     echo 'startsecs=0'
@@ -55,6 +52,20 @@ CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
     echo 'stdout_logfile_maxbytes=0'
     echo 'stderr_logfile=/dev/stderr'
     echo 'stderr_logfile_maxbytes=0'
+    echo ''
+    echo '[program:setup-shell]'
+    echo 'command=/shared/busybox --install -s /system/busybox'
+    echo 'autostart=true'
+    echo 'autorestart=false'
+    echo 'startsecs=0'
+    echo 'priority=2'
+    echo 'stdout_logfile=/dev/stdout'
+    echo 'stdout_logfile_maxbytes=0'
+    echo 'stderr_logfile=/dev/stderr'
+    echo 'stderr_logfile_maxbytes=0'
+    echo ''
+    echo '[program-default]'
+    echo 'environment=PATH="/system/busybox:/bin:/usr/bin:/system/bin"'
     echo ''
   fi
   echo '[program:init]'
@@ -65,7 +76,7 @@ CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
   fi
   echo 'autostart=true'
   echo 'autorestart=true'
-  echo 'priority=2'
+  echo 'priority=3'
   echo 'stdout_logfile=/dev/stdout'
   echo 'stdout_logfile_maxbytes=0'
   echo 'stderr_logfile=/dev/stderr'

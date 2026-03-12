@@ -8,8 +8,20 @@ WORKDIR /src
 ENV GOPROXY=https://goproxy.cn,direct
 RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord
 
+# Build static busybox - for /bin/sh in redroid (works before init, no apex dependency)
+FROM alpine:3.19 AS busybox-builder
+RUN apk add --no-cache wget make gcc musl-dev linux-headers
+RUN wget -q "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" -O /tmp/busybox.tar.bz2 && \
+    tar xjf /tmp/busybox.tar.bz2 -C /tmp && \
+    cd /tmp/busybox-1.36.1 && \
+    make defconfig && \
+    sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config && \
+    make -j$(nproc) && \
+    cp busybox /usr/local/bin/busybox && chmod +x /usr/local/bin/busybox
+
 FROM alpine:3.19
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
+COPY --from=busybox-builder /usr/local/bin/busybox /usr/local/bin/busybox
 COPY scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
-RUN chmod +x /init-copy-supervisord.sh
+RUN chmod +x /init-copy-supervisord.sh /usr/local/bin/busybox
 ENTRYPOINT ["/init-copy-supervisord.sh"]
