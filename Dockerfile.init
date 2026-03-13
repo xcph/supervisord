@@ -32,6 +32,29 @@ RUN wget -q "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/
     LDFLAGS="--static" make toybox && \
     PREFIX=/usr/local/toybox-bin make install_flat
 
+# Build static curl: gcc cannot produce static binary on Alpine, use clang (see static-curl)
+# Disable brotli/zstd to avoid LTO/plugin link issues; openssl+zlib+nghttp2 suffice
+FROM alpine:3.22.3 AS curl-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make clang musl-dev pkgconfig ca-certificates \
+        openssl-dev openssl-libs-static \
+        zlib-dev zlib-static \
+        nghttp2-dev nghttp2-static
+RUN wget -q "https://curl.se/download/curl-8.19.0.tar.gz" -O /tmp/curl.tar.gz && \
+    tar xzf /tmp/curl.tar.gz -C /tmp && \
+    cd /tmp/curl-8.19.0 && \
+    CC=clang LDFLAGS="-static" PKG_CONFIG="pkg-config --static" ./configure \
+        --disable-shared --enable-static \
+        --with-openssl --with-zlib --with-nghttp2 \
+        --without-brotli --without-zstd \
+        --without-libpsl --without-libssh2 --without-libidn2 \
+        --disable-ldap --disable-ares \
+        --enable-websockets \
+        --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
+        --prefix=/usr/local/curl-bin && \
+    make -j$(nproc) LDFLAGS="-static -all-static" && \
+    make install
+
 # Build static busybox - sh/su/id with better Ctrl+C; install to /usr/local/busybox (→ /shared/busybox)
 FROM alpine:3.22.3 AS busybox-builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
@@ -41,15 +64,21 @@ RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busyb
     cd /tmp/busybox-1.37.0 && \
     make defconfig && \
     sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config && \
+    sed -i 's/# CONFIG_IP is not set/CONFIG_IP=y/' .config && \
+    sed -i 's/# CONFIG_WGET is not set/CONFIG_WGET=y/' .config && \
+    sed -i '/# CONFIG_TELNET is not set/d' .config && echo 'CONFIG_TELNET=y' >> .config && \
+    sed -i '/# CONFIG_NC is not set/d' .config && echo 'CONFIG_NC=y' >> .config && \
     sed -i 's/CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' .config && \
     sed -i 's/CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' .config && \
     sed -i 's/CONFIG_TC=y/# CONFIG_TC is not set/' .config && \
+    yes "" | make oldconfig && \
     make -j$(nproc) && \
     make install CONFIG_PREFIX=/usr/local/busybox
 
 FROM alpine:3.22.3
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
 COPY --from=builder /usr/local/bin/exec-in-ns /usr/local/bin/exec-in-ns
+COPY --from=curl-builder /usr/local/curl-bin/bin/curl /usr/local/bin/curl
 COPY --from=toybox-builder /usr/local/toybox-bin /usr/local/toybox-bin
 COPY --from=busybox-builder /usr/local/busybox /usr/local/busybox
 COPY scripts/init-copy-supervisord.sh /init-copy-supervisord.sh

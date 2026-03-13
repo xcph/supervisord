@@ -10,6 +10,7 @@ mkdir -p "$SHARED"
 mkdir -p "$SHARED/supervisord" "$SHARED/bin"
 cp -f /usr/local/bin/supervisord "$SHARED/supervisord/supervisord"
 cp -f /usr/local/bin/exec-in-ns "$SHARED/supervisord/exec-in-ns"
+[ -f /usr/local/bin/curl ] && cp -f /usr/local/bin/curl "$SHARED/bin/curl" && chmod +x "$SHARED/bin/curl"
 [ -f /scripts/diag-network-after-init-restart.sh ] && cp -f /scripts/diag-network-after-init-restart.sh "$SHARED/supervisord/"
 chmod +x "$SHARED/supervisord/supervisord" "$SHARED/supervisord/exec-in-ns"
 # Symlink so "supervisord" is found in PATH for ctl exec
@@ -29,6 +30,10 @@ if [ -d /usr/local/busybox ]; then
   mkdir -p "$SHARED/busybox"
   cp -a /usr/local/busybox/. "$SHARED/busybox/"
   chmod -R a+x "$SHARED/busybox"
+  # Ensure nc and telnet symlinks exist (busybox applets)
+  for cmd in nc netcat telnet; do
+    [ ! -e "$SHARED/busybox/bin/$cmd" ] && ln -sf busybox "$SHARED/busybox/bin/$cmd"
+  done
   HAS_UTILS=1
   SH_SHELL="/shared/busybox/bin/sh"
 fi
