@@ -8,7 +8,8 @@ COPY . /src
 WORKDIR /src
 
 ENV GOPROXY=https://goproxy.cn,direct
-RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord
+RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord && \
+    CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/exec-in-ns ./cmd/exec-in-ns
 
 # Build static toybox - for sh/cat/ls in redroid (works before init, no apex dependency)
 FROM alpine:3.22.3 AS toybox-builder
@@ -48,8 +49,10 @@ RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busyb
 
 FROM alpine:3.22.3
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
+COPY --from=builder /usr/local/bin/exec-in-ns /usr/local/bin/exec-in-ns
 COPY --from=toybox-builder /usr/local/toybox-bin /usr/local/toybox-bin
 COPY --from=busybox-builder /usr/local/busybox /usr/local/busybox
 COPY scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
-RUN chmod +x /init-copy-supervisord.sh
+COPY scripts/diag-network-after-init-restart.sh /scripts/diag-network-after-init-restart.sh
+RUN chmod +x /init-copy-supervisord.sh /scripts/diag-network-after-init-restart.sh
 ENTRYPOINT ["/init-copy-supervisord.sh"]

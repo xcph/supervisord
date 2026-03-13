@@ -1,8 +1,6 @@
 module github.com/ochinchina/supervisord
 
-go 1.24.0
-
-toolchain go1.24.4
+go 1.25.0
 
 require (
 	github.com/gorilla/mux v1.8.1
@@ -24,8 +22,13 @@ require (
 	github.com/ochinchina/supervisord/xmlrpcclient v0.0.0-20250610055946-d5a5470d11af
 	github.com/prometheus/client_golang v1.22.0
 	github.com/sirupsen/logrus v1.9.3
-	golang.org/x/sys v0.33.0
+	golang.org/x/sys v0.42.0
 	google.golang.org/protobuf v1.36.6 // indirect; CVE-2024-24786
+)
+
+require (
+	github.com/creack/pty v1.1.24
+	golang.org/x/term v0.41.0
 )
 
 require (
@@ -36,17 +39,12 @@ require (
 	github.com/mitchellh/go-ps v1.0.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/ochinchina/filechangemonitor v0.3.1 // indirect
-	github.com/pion/dtls/v3 v3.0.10 // indirect
-	github.com/pion/logging v0.2.4 // indirect
-	github.com/pion/stun/v3 v3.1.1 // indirect
-	github.com/pion/transport/v4 v4.0.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.64.0 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/robfig/cron/v3 v3.0.1 // indirect
 	github.com/rogpeppe/go-charset v0.0.0-20190617161244-0dc95cdf6f31 // indirect
-	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.32.0 // indirect
+	github.com/stretchr/testify v1.11.1 // indirect
 )
 
 replace (

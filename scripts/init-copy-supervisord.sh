@@ -1,14 +1,19 @@
 #!/bin/sh
-# Init container script: copy supervisord binary and write config to /shared volume.
-# The main container will run supervisord from /shared/supervisord.
+# Init container script: copy supervisord binary and config to /shared/supervisord/.
+# The main container runs /shared/supervisord/supervisord.
 set -e
 
 SHARED="${SHARED_DIR:-/shared}"
 mkdir -p "$SHARED"
 
-# Copy supervisord binary
-cp -f /usr/local/bin/supervisord "$SHARED/supervisord"
-chmod +x "$SHARED/supervisord"
+# Copy supervisord binary and config to /shared/supervisord/
+mkdir -p "$SHARED/supervisord" "$SHARED/bin"
+cp -f /usr/local/bin/supervisord "$SHARED/supervisord/supervisord"
+cp -f /usr/local/bin/exec-in-ns "$SHARED/supervisord/exec-in-ns"
+[ -f /scripts/diag-network-after-init-restart.sh ] && cp -f /scripts/diag-network-after-init-restart.sh "$SHARED/supervisord/"
+chmod +x "$SHARED/supervisord/supervisord" "$SHARED/supervisord/exec-in-ns"
+# Symlink so "supervisord" is found in PATH for ctl exec
+ln -sf "$SHARED/supervisord/supervisord" "$SHARED/bin/supervisord"
 
 # Copy toybox and busybox to /shared (for kubectl exec; redroid has no /bin/sh)
 HAS_UTILS=0
@@ -70,7 +75,7 @@ CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
     echo 'stderr_logfile_maxbytes=0'
     echo ''
     echo '[program-default]'
-    echo 'environment=PATH="/shared/bin:/shared/busybox/bin:/shared/toybox-bin:/bin:/usr/bin:/system/bin"'
+    echo 'environment=PATH="/shared/bin:/shared/supervisord:/shared/busybox/bin:/shared/toybox-bin:/bin:/usr/bin:/system/bin",SUPERVISORD_PATH="/shared/supervisord/supervisord",EXEC_IN_NS_PATH="/shared/supervisord/exec-in-ns"'
     echo ''
   fi
   echo '[program:init]'
@@ -88,6 +93,6 @@ CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
   echo 'stderr_logfile_maxbytes=0'
   echo "container_run=$CONTAINER_RUN"
   echo "container_network_isolated=$CONTAINER_NETWORK_ISOLATED"
-} > "$SHARED/supervisord.conf"
+} > "$SHARED/supervisord/supervisord.conf"
 
-echo "supervisord and config copied to $SHARED"
+echo "supervisord and config copied to $SHARED/supervisord"

@@ -39,7 +39,7 @@ func getSupervisordPath() string {
 			return abs
 		}
 	}
-	for _, p := range []string{"/shared/supervisord", "/usr/local/bin/supervisord"} {
+	for _, p := range []string{"/shared/supervisord/supervisord", "/usr/local/bin/supervisord"} {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}

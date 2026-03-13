@@ -133,7 +133,6 @@ func findSupervisordConf() (string, error) {
 func runServer() {
 	// infinite loop for handling Restart ('reload' command)
 	loadEnvFile()
-	getPublicIPFromSTUN() // set PUBLIC_IP for child processes (e.g. redroid WebRTC)
 	for {
 		if len(options.Configuration) <= 0 {
 			options.Configuration, _ = findSupervisordConf()
