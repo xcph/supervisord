@@ -32,27 +32,54 @@ RUN wget -q "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/
     LDFLAGS="--static" make toybox && \
     PREFIX=/usr/local/toybox-bin make install_flat
 
-# Build static curl: gcc cannot produce static binary on Alpine, use clang (see static-curl)
-# Disable brotli/zstd to avoid LTO/plugin link issues; openssl+zlib+nghttp2 suffice
+# Build nghttp3 (HTTP/3 library, static only)
+FROM alpine:3.22.3 AS nghttp3-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev autoconf automake libtool
+RUN wget -q "https://github.com/ngtcp2/nghttp3/releases/download/v1.11.0/nghttp3-1.11.0.tar.gz" -O /tmp/nghttp3.tar.gz && \
+    tar xzf /tmp/nghttp3.tar.gz -C /tmp && \
+    cd /tmp/nghttp3-1.11.0 && \
+    ./configure --enable-lib-only --disable-shared --prefix=/usr/local/http3 && \
+    make -j$(nproc) && make install
+
+# Build ngtcp2 (QUIC, static, needs OpenSSL 3.5+)
+FROM alpine:3.22.3 AS ngtcp2-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev autoconf automake libtool pkgconfig \
+        openssl-dev openssl-libs-static
+COPY --from=nghttp3-builder /usr/local/http3 /usr/local/http3
+RUN wget -q "https://github.com/ngtcp2/ngtcp2/releases/download/v1.12.0/ngtcp2-1.12.0.tar.gz" -O /tmp/ngtcp2.tar.gz && \
+    tar xzf /tmp/ngtcp2.tar.gz -C /tmp && \
+    cd /tmp/ngtcp2-1.12.0 && \
+    PKG_CONFIG_PATH=/usr/local/http3/lib/pkgconfig \
+    ./configure --prefix=/usr/local/http3 --enable-lib-only --disable-shared \
+        --with-openssl && \
+    make -j$(nproc) && make install
+
+# Build static curl with HTTP/3: gcc cannot produce static binary on Alpine, use clang
 FROM alpine:3.22.3 AS curl-builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
     apk add --no-cache wget make clang musl-dev pkgconfig ca-certificates \
         openssl-dev openssl-libs-static \
         zlib-dev zlib-static \
         nghttp2-dev nghttp2-static
+COPY --from=ngtcp2-builder /usr/local/http3 /usr/local/http3
 RUN wget -q "https://curl.se/download/curl-8.19.0.tar.gz" -O /tmp/curl.tar.gz && \
     tar xzf /tmp/curl.tar.gz -C /tmp && \
     cd /tmp/curl-8.19.0 && \
-    CC=clang LDFLAGS="-static" PKG_CONFIG="pkg-config --static" ./configure \
+    CC=clang LDFLAGS="-static -L/usr/local/http3/lib" \
+    PKG_CONFIG_PATH=/usr/local/http3/lib/pkgconfig PKG_CONFIG="pkg-config --static" \
+    ./configure \
         --disable-shared --enable-static \
         --with-openssl --with-zlib --with-nghttp2 \
+        --with-nghttp3=/usr/local/http3 --with-ngtcp2=/usr/local/http3 \
         --without-brotli --without-zstd \
         --without-libpsl --without-libssh2 --without-libidn2 \
         --disable-ldap --disable-ares \
         --enable-websockets \
         --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
         --prefix=/usr/local/curl-bin && \
-    make -j$(nproc) LDFLAGS="-static -all-static" && \
+    make -j$(nproc) LDFLAGS="-static -all-static -L/usr/local/http3/lib" && \
     make install
 
 # Build static busybox - sh/su/id with better Ctrl+C; install to /usr/local/busybox (→ /shared/busybox)
