@@ -1,27 +1,55 @@
 # Dockerfile.init builds an image for the init container that copies supervisord
 # and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
-FROM golang:1.26.1 AS builder
-RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends git gcc && rm -rf /var/lib/apt/lists/*
+# Build with musl (Alpine) for static binary, no glibc dependency.
+FROM golang:1.26.1-alpine3.23 AS builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache gcc musl-dev
 COPY . /src
 WORKDIR /src
 
 ENV GOPROXY=https://goproxy.cn,direct
 RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord
 
-# Build static busybox - for /bin/sh in redroid (works before init, no apex dependency)
-FROM alpine:3.19 AS busybox-builder
-RUN apk add --no-cache wget make gcc musl-dev linux-headers
-RUN wget -q "https://busybox.net/downloads/busybox-1.36.1.tar.bz2" -O /tmp/busybox.tar.bz2 && \
+# Build static toybox - for sh/cat/ls in redroid (works before init, no apex dependency)
+FROM alpine:3.22.3 AS toybox-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev linux-headers openssl-dev zlib-dev bash
+RUN wget -q "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/toybox.tar.gz && \
+    tar xzf /tmp/toybox.tar.gz -C /tmp && \
+    cd /tmp/toybox-0.8.13 && \
+    make defconfig && \
+    sed -i 's/# CONFIG_SH is not set/CONFIG_SH=y/' .config && \
+    sed -i 's/# CONFIG_IP is not set/CONFIG_IP=y/' .config && \
+    sed -i 's/# CONFIG_IPTUNNEL is not set/CONFIG_IPTUNNEL=y/' .config && \
+    sed -i 's/# CONFIG_WGET is not set/CONFIG_WGET=y/' .config && \
+    yes "" | make oldconfig && \
+    sed -i '/if_tunnel/i\'$'\n''#include <linux/ip.h>' toys/pending/ip.c && \
+    sed -i 's/if (!if_indextoname(link->parent, iface)) perror_exit(NULL);/if (if_indextoname(link->parent, iface))/' toys/pending/ip.c && \
+    sed -i 's| sprintf(toybuf,"%s@%s", link->iface, iface);|  sprintf(toybuf,"%s@%s", link->iface, iface);\
+  else\
+    snprintf(toybuf, sizeof(toybuf), "%s@if%d", link->iface, link->parent);|' toys/pending/ip.c && \
+    LDFLAGS="--static" make toybox && \
+    PREFIX=/usr/local/toybox-bin make install_flat
+
+# Build static busybox - sh/su/id with better Ctrl+C; install to /usr/local/busybox (→ /shared/busybox)
+FROM alpine:3.22.3 AS busybox-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev linux-headers perl
+RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busybox.tar.bz2 && \
     tar xjf /tmp/busybox.tar.bz2 -C /tmp && \
-    cd /tmp/busybox-1.36.1 && \
+    cd /tmp/busybox-1.37.0 && \
     make defconfig && \
     sed -i 's/# CONFIG_STATIC is not set/CONFIG_STATIC=y/' .config && \
+    sed -i 's/CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' .config && \
+    sed -i 's/CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' .config && \
+    sed -i 's/CONFIG_TC=y/# CONFIG_TC is not set/' .config && \
     make -j$(nproc) && \
-    cp busybox /usr/local/bin/busybox && chmod +x /usr/local/bin/busybox
+    make install CONFIG_PREFIX=/usr/local/busybox
 
-FROM alpine:3.19
+FROM alpine:3.22.3
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
-COPY --from=busybox-builder /usr/local/bin/busybox /usr/local/bin/busybox
+COPY --from=toybox-builder /usr/local/toybox-bin /usr/local/toybox-bin
+COPY --from=busybox-builder /usr/local/busybox /usr/local/busybox
 COPY scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
-RUN chmod +x /init-copy-supervisord.sh /usr/local/bin/busybox
+RUN chmod +x /init-copy-supervisord.sh
 ENTRYPOINT ["/init-copy-supervisord.sh"]

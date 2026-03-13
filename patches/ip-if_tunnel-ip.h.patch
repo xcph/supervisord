@@ -1,0 +1,10 @@
+--- a/toys/pending/ip.c
++++ b/toys/pending/ip.c
+@@ -32,6 +32,7 @@
+ #include <linux/if.h>
+ #include <linux/if_addr.h>
+ #include <linux/if_arp.h>
++#include <linux/ip.h>
+ #include <linux/if_tunnel.h>
+ #include <linux/ipv6_route.h>
+ #include <linux/nexthop.h>

@@ -1,0 +1,14 @@
+--- a/toys/pending/ip.c
++++ b/toys/pending/ip.c
+@@ -861,6 +861,9 @@
+  if (link->parent != -1) {
+  char iface[IF_NAMESIZE];
+ 
+- if (!if_indextoname(link->parent, iface)) perror_exit(NULL);
+- sprintf(toybuf,"%s@%s", link->iface, iface);
++ if (if_indextoname(link->parent, iface))
++   sprintf(toybuf,"%s@%s", link->iface, iface);
++ else
++   snprintf(toybuf, sizeof(toybuf), "%s@if%d", link->iface, link->parent);
+  }
+  if (link->flags & IFF_POINTOPOINT) peer = "peer";
