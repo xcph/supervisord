@@ -1,7 +1,7 @@
 # Dockerfile.init builds an image for the init container that copies supervisord
 # and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
 # Build with musl (Alpine) for static binary, no glibc dependency.
-FROM golang:1.26.1-alpine3.23 AS builder
+FROM golang:1.25-alpine3.22 AS builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
     apk add --no-cache gcc musl-dev
 COPY . /src
@@ -32,54 +32,202 @@ RUN wget -q "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/
     LDFLAGS="--static" make toybox && \
     PREFIX=/usr/local/toybox-bin make install_flat
 
-# Build nghttp3 (HTTP/3 library, static only)
+# === Custom deps for curl (version >= user spec) ===
+# OpenSSL 3.6.1
+FROM alpine:3.22.3 AS openssl-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev perl linux-headers
+RUN wget -q "https://github.com/openssl/openssl/releases/download/openssl-3.6.1/openssl-3.6.1.tar.gz" -O /tmp/openssl.tar.gz && \
+    tar xzf /tmp/openssl.tar.gz -C /tmp && cd /tmp/openssl-3.6.1 && \
+    ./config --prefix=/usr/local/curl-deps no-shared -fPIC && \
+    make -j$(nproc) && make install_sw install_ssldirs
+
+# zlib 1.3.1 (>=1.2.12, use Alpine pkg - source build has musl issues)
+FROM alpine:3.22.3 AS zlib-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache zlib-dev zlib-static
+RUN mkdir -p /usr/local/curl-deps/lib /usr/local/curl-deps/include /usr/local/curl-deps/lib/pkgconfig && \
+    cp -a /usr/lib/libz.a /usr/local/curl-deps/lib/ && \
+    cp -a /usr/include/zlib.h /usr/include/zconf.h /usr/local/curl-deps/include/ 2>/dev/null || cp -a /usr/include/zlib.h /usr/local/curl-deps/include/ && \
+    cp -a /usr/lib/pkgconfig/zlib.pc /usr/local/curl-deps/lib/pkgconfig/ && \
+    sed -i 's|^prefix=.*|prefix=/usr/local/curl-deps|' /usr/local/curl-deps/lib/pkgconfig/zlib.pc
+
+# nghttp2 1.68.0
+FROM alpine:3.22.3 AS nghttp2-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev autoconf automake libtool pkgconfig
+RUN wget -q "https://github.com/nghttp2/nghttp2/releases/download/v1.68.0/nghttp2-1.68.0.tar.gz" -O /tmp/nghttp2.tar.gz && \
+    tar xzf /tmp/nghttp2.tar.gz -C /tmp && cd /tmp/nghttp2-1.68.0 && \
+    ./configure --prefix=/usr/local/curl-deps --enable-lib-only --disable-shared && \
+    make -j$(nproc) && make install
+
+# brotli 1.2.0
+FROM alpine:3.22.3 AS brotli-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget cmake make gcc musl-dev
+RUN wget -q "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz" -O /tmp/brotli.tar.gz && \
+    tar xzf /tmp/brotli.tar.gz -C /tmp && cd /tmp/brotli-1.2.0 && mkdir build && cd build && \
+    cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local/curl-deps -DBUILD_SHARED_LIBS=OFF \
+        -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+    make -j$(nproc) && make install
+
+# zstd 1.5.7
+FROM alpine:3.22.3 AS zstd-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev
+RUN wget -q "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz" -O /tmp/zstd.tar.gz && \
+    tar xzf /tmp/zstd.tar.gz -C /tmp && cd /tmp/zstd-1.5.7 && \
+    make -j$(nproc) -C lib && \
+    make -C lib install PREFIX=/usr/local/curl-deps
+
+# libidn2 (AppleIDN, needs libunistring from Alpine)
+FROM alpine:3.22.3 AS libidn2-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev autoconf automake libtool gettext-dev libunistring-dev libunistring-static
+RUN wget -q "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.7.tar.gz" -O /tmp/libidn2.tar.gz && \
+    tar xzf /tmp/libidn2.tar.gz -C /tmp && cd /tmp/libidn2-2.3.7 && \
+    ./configure --prefix=/usr/local/curl-deps --disable-shared --disable-doc && \
+    make -j$(nproc) && make install
+
+# libssh2 1.11.1 (needs OpenSSL + zlib)
+FROM alpine:3.22.3 AS libssh2-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev autoconf automake libtool
+COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
+COPY --from=zlib-builder /usr/local/curl-deps /tmp/zlib-deps
+RUN cp -a /tmp/zlib-deps/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/zlib-deps/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+RUN wget -q "https://www.libssh2.org/download/libssh2-1.11.1.tar.gz" -O /tmp/libssh2.tar.gz && \
+    tar xzf /tmp/libssh2.tar.gz -C /tmp && cd /tmp/libssh2-1.11.1 && \
+    ./configure --prefix=/usr/local/curl-deps --with-openssl --with-zlib \
+        --disable-shared LDFLAGS="-L/usr/local/curl-deps/lib" CPPFLAGS="-I/usr/local/curl-deps/include" && \
+    make -j$(nproc) && make install
+
+# OpenLDAP 2.6.13 (client libs only, for curl LDAP/LDAPS)
+FROM alpine:3.22.3 AS openldap-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev groff
+COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
+RUN wget -q "https://www.openldap.org/software/download/OpenLDAP/openldap-release/openldap-2.6.13.tgz" -O /tmp/openldap.tar.gz && \
+    tar xzf /tmp/openldap.tar.gz -C /tmp && cd /tmp/openldap-2.6.13 && \
+    CPPFLAGS="-I/usr/local/curl-deps/include" LDFLAGS="-L/usr/local/curl-deps/lib" \
+    ./configure --prefix=/usr/local/curl-deps --disable-slapd --disable-bdb --disable-hdb \
+        --with-tls=openssl --disable-shared --enable-static && \
+    make -j$(nproc) depend && make -j$(nproc) && make install
+
+# MIT Kerberos krb5-1.22.2 (for curl GSS-API)
+FROM alpine:3.22.3 AS krb5-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev bison perl ncurses-dev
+COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
+# krb5: build util+include+lib only (skip kadmin/kdc to avoid master_keyblock duplicate def)
+RUN wget -q "https://kerberos.org/dist/krb5/1.22/krb5-1.22.2.tar.gz" -O /tmp/krb5.tar.gz && \
+    tar xzf /tmp/krb5.tar.gz -C /tmp && cd /tmp/krb5-1.22.2/src && \
+    CPPFLAGS="-I/usr/local/curl-deps/include" LDFLAGS="-L/usr/local/curl-deps/lib" \
+    ./configure --prefix=/usr/local/curl-deps --with-crypto-impl=openssl \
+        --disable-shared --enable-static && \
+    for d in include lib; do find $d -type d 2>/dev/null | while read dir; do mkdir -p /usr/local/curl-deps/"$dir"; done; done && \
+    mkdir -p /usr/local/curl-deps/include/gssapi /usr/local/curl-deps/include/kadm5 \
+        /usr/local/curl-deps/bin /usr/local/curl-deps/sbin \
+        /usr/local/curl-deps/share/man/man1 /usr/local/curl-deps/share/et && \
+    make -j$(nproc) -C util && make -j$(nproc) -C include && make -j$(nproc) -C lib && \
+    make -C util install && make -C include install && make -C lib install && \
+    mkdir -p /usr/local/curl-deps/lib/pkgconfig && \
+    printf '%s\n' \
+        'prefix=/usr/local/curl-deps' \
+        'exec_prefix=${prefix}' \
+        'libdir=${prefix}/lib' \
+        'includedir=${prefix}/include' \
+        'Name: mit-krb5-gssapi' \
+        'Description: MIT Kerberos GSS-API' \
+        'Version: 1.22.2' \
+        'Cflags: -I${includedir}' \
+        'Libs: -L${libdir} -lgssapi_krb5 -lkrb5 -lk5crypto -lcom_err -lkrb5support -lcrypto -lresolv' \
+        'Libs.private: -L${libdir} -lgssapi_krb5 -lkrb5 -lk5crypto -lcom_err -lkrb5support -lcrypto -lresolv' \
+        > /usr/local/curl-deps/lib/pkgconfig/mit-krb5-gssapi.pc
+
+# Merge all curl deps into /usr/local/curl-deps
+FROM alpine:3.22.3 AS curl-deps-all
+COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
+COPY --from=zlib-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=nghttp2-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=brotli-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=zstd-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=libidn2-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=libssh2-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=openldap-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+COPY --from=krb5-builder /usr/local/curl-deps /tmp/z
+RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
+    cp -a /tmp/z/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
+
+# Build nghttp3 1.15.0 (HTTP/3 library, static only)
 FROM alpine:3.22.3 AS nghttp3-builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev autoconf automake libtool
-RUN wget -q "https://github.com/ngtcp2/nghttp3/releases/download/v1.11.0/nghttp3-1.11.0.tar.gz" -O /tmp/nghttp3.tar.gz && \
+RUN wget -q "https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.gz" -O /tmp/nghttp3.tar.gz && \
     tar xzf /tmp/nghttp3.tar.gz -C /tmp && \
-    cd /tmp/nghttp3-1.11.0 && \
+    cd /tmp/nghttp3-1.15.0 && \
     ./configure --enable-lib-only --disable-shared --prefix=/usr/local/http3 && \
     make -j$(nproc) && make install
 
-# Build ngtcp2 (QUIC, static, needs OpenSSL 3.5+)
+# Build ngtcp2 1.20.0 (QUIC, static, needs OpenSSL 3.5+)
 FROM alpine:3.22.3 AS ngtcp2-builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
-    apk add --no-cache wget make gcc musl-dev autoconf automake libtool pkgconfig \
-        openssl-dev openssl-libs-static
+    apk add --no-cache wget make gcc musl-dev autoconf automake libtool pkgconfig
+COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
 COPY --from=nghttp3-builder /usr/local/http3 /usr/local/http3
-RUN wget -q "https://github.com/ngtcp2/ngtcp2/releases/download/v1.12.0/ngtcp2-1.12.0.tar.gz" -O /tmp/ngtcp2.tar.gz && \
+RUN wget -q "https://github.com/ngtcp2/ngtcp2/releases/download/v1.20.0/ngtcp2-1.20.0.tar.gz" -O /tmp/ngtcp2.tar.gz && \
     tar xzf /tmp/ngtcp2.tar.gz -C /tmp && \
-    cd /tmp/ngtcp2-1.12.0 && \
-    PKG_CONFIG_PATH=/usr/local/http3/lib/pkgconfig \
+    cd /tmp/ngtcp2-1.20.0 && \
+    PKG_CONFIG_PATH=/usr/local/curl-deps/lib/pkgconfig:/usr/local/http3/lib/pkgconfig \
     ./configure --prefix=/usr/local/http3 --enable-lib-only --disable-shared \
-        --with-openssl && \
-    make -j$(nproc) && make install
+        --with-openssl=/usr/local/curl-deps && \
+    make -j$(nproc) LDFLAGS="-L/usr/local/curl-deps/lib" && make install && \
+    cp -a crypto/includes/ngtcp2/ngtcp2_crypto.h crypto/includes/ngtcp2/ngtcp2_crypto_ossl.h \
+        /usr/local/http3/include/ngtcp2/
+COPY libngtcp2_crypto_ossl.pc /usr/local/http3/lib/pkgconfig/libngtcp2_crypto_ossl.pc
 
-# Build static curl with HTTP/3: gcc cannot produce static binary on Alpine, use clang
+# Build static curl: custom deps (OpenSSL 3.6.1 zlib 1.3.1 brotli 1.2.0 zstd 1.5.7
+# libssh2 1.11.1 nghttp2 1.68.0 libidn2 OpenLDAP 2.6.13 krb5-1.22.2) + ngtcp2/nghttp3 for HTTP/3.
 FROM alpine:3.22.3 AS curl-builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
-    apk add --no-cache wget make clang musl-dev pkgconfig ca-certificates \
-        openssl-dev openssl-libs-static \
-        zlib-dev zlib-static \
-        nghttp2-dev nghttp2-static
+    apk add --no-cache wget make clang musl-dev pkgconfig ca-certificates libunistring-static gettext-static
+COPY --from=curl-deps-all /usr/local/curl-deps /usr/local/curl-deps
 COPY --from=ngtcp2-builder /usr/local/http3 /usr/local/http3
 RUN wget -q "https://curl.se/download/curl-8.19.0.tar.gz" -O /tmp/curl.tar.gz && \
     tar xzf /tmp/curl.tar.gz -C /tmp && \
     cd /tmp/curl-8.19.0 && \
-    CC=clang LDFLAGS="-static -L/usr/local/http3/lib" \
-    PKG_CONFIG_PATH=/usr/local/http3/lib/pkgconfig PKG_CONFIG="pkg-config --static" \
+    PKG_CONFIG_PATH=/usr/local/curl-deps/lib/pkgconfig:/usr/local/http3/lib/pkgconfig \
+    CC=clang LDFLAGS="-static -L/usr/local/curl-deps/lib -L/usr/local/http3/lib" \
+    CPPFLAGS="-I/usr/local/curl-deps/include -I/usr/local/http3/include -DOPENSSL_QUIC_API2" \
+    PKG_CONFIG="pkg-config --static" \
     ./configure \
         --disable-shared --enable-static \
-        --with-openssl --with-zlib --with-nghttp2 \
+        --with-openssl=/usr/local/curl-deps --with-zlib=/usr/local/curl-deps \
+        --with-nghttp2=/usr/local/curl-deps --with-brotli=/usr/local/curl-deps \
+        --with-zstd=/usr/local/curl-deps --with-libssh2=/usr/local/curl-deps \
+        --with-libidn2=/usr/local/curl-deps \
+        --with-gssapi=/usr/local/curl-deps --with-ldap=/usr/local/curl-deps \
         --with-nghttp3=/usr/local/http3 --with-ngtcp2=/usr/local/http3 \
-        --without-brotli --without-zstd \
-        --without-libpsl --without-libssh2 --without-libidn2 \
-        --disable-ldap --disable-ares \
+        --without-libpsl --disable-ares \
         --enable-websockets \
-        --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
+        --with-ca-bundle=/shared/etc/ssl/certs/ca-certificates.crt \
         --prefix=/usr/local/curl-bin && \
-    make -j$(nproc) LDFLAGS="-static -all-static -L/usr/local/http3/lib" && \
+    make -j$(nproc) LDFLAGS="-static -all-static -L/usr/local/curl-deps/lib -L/usr/local/http3/lib" && \
     make install
 
 # Build static busybox - sh/su/id with better Ctrl+C; install to /usr/local/busybox (→ /shared/busybox)
@@ -103,6 +251,7 @@ RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busyb
     make install CONFIG_PREFIX=/usr/local/busybox
 
 FROM alpine:3.22.3
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
 COPY --from=builder /usr/local/bin/exec-in-ns /usr/local/bin/exec-in-ns
 COPY --from=curl-builder /usr/local/curl-bin/bin/curl /usr/local/bin/curl

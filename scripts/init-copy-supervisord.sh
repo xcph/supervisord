@@ -41,6 +41,9 @@ fi
 # Create passwd/group for root
 mkdir -p "$SHARED/etc"
 printf '%s\n' "root:x:0:0:root:/root:$SH_SHELL" > "$SHARED/etc/passwd"
+# Copy CA certs for curl (default: --with-ca-bundle=/shared/etc/ssl/certs/ca-certificates.crt)
+mkdir -p "$SHARED/etc/ssl/certs"
+[ -f /etc/ssl/certs/ca-certificates.crt ] && cp -f /etc/ssl/certs/ca-certificates.crt "$SHARED/etc/ssl/certs/"
 printf '%s\n' 'root:x:0:' > "$SHARED/etc/group"
 sync
 
