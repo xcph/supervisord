@@ -10,9 +10,11 @@ mkdir -p "$SHARED"
 mkdir -p "$SHARED/supervisord" "$SHARED/bin"
 cp -f /usr/local/bin/supervisord "$SHARED/supervisord/supervisord"
 cp -f /usr/local/bin/exec-in-ns "$SHARED/supervisord/exec-in-ns"
+cp -f /usr/local/bin/cpu-simulator "$SHARED/supervisord/cpu-simulator"
+cp -f /usr/local/bin/procfs-simulator "$SHARED/supervisord/procfs-simulator"
 [ -f /usr/local/bin/curl ] && cp -f /usr/local/bin/curl "$SHARED/bin/curl" && chmod +x "$SHARED/bin/curl"
 [ -f /scripts/diag-network-after-init-restart.sh ] && cp -f /scripts/diag-network-after-init-restart.sh "$SHARED/supervisord/"
-chmod +x "$SHARED/supervisord/supervisord" "$SHARED/supervisord/exec-in-ns"
+chmod +x "$SHARED/supervisord/supervisord" "$SHARED/supervisord/exec-in-ns" "$SHARED/supervisord/cpu-simulator" "$SHARED/supervisord/procfs-simulator"
 # Symlink so "supervisord" is found in PATH for ctl exec
 ln -sf "$SHARED/supervisord/supervisord" "$SHARED/bin/supervisord"
 
@@ -57,6 +59,7 @@ sync
 INIT_CMD="${INIT_COMMAND:-/init}"
 CONTAINER_RUN="${CONTAINER_RUN:-true}"
 CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
+CPU_SIMULATION_ENABLED="${CPU_SIMULATION_ENABLED:-true}"
 {
   echo '[supervisord]'
   echo 'nodaemon=true'
@@ -69,6 +72,19 @@ CONTAINER_NETWORK_ISOLATED="${CONTAINER_NETWORK_ISOLATED:-false}"
   echo '[supervisorctl]'
   echo 'serverurl=http://127.0.0.1:9001'
   echo ''
+  if [ "$CPU_SIMULATION_ENABLED" = "true" ]; then
+    # cpu-simulator: runs before init (priority=0), writes to $SHARED/cpu-sim for init/redroid to mount.
+    echo '[program:cpu-simulator]'
+    echo "command=$SH_SHELL -c 'exec $SHARED/supervisord/cpu-simulator -cpu=\"\${RESOURCE_CPU_LIMIT:-8}\" -root=\"$SHARED/cpu-sim\"'"
+    echo 'autostart=true'
+    echo 'autorestart=true'
+    echo 'priority=0'
+    echo 'stdout_logfile=/dev/stdout'
+    echo 'stdout_logfile_maxbytes=0'
+    echo 'stderr_logfile=/dev/stderr'
+    echo 'stderr_logfile_maxbytes=0'
+    echo ''
+  fi
   if [ "$HAS_UTILS" = 1 ]; then
     echo '# Ensure /etc/passwd, /etc/group, /root (fix su/id; su needs root home dir)'
     echo '[program:setup-etc]'

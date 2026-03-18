@@ -1,7 +1,7 @@
 # Dockerfile.init builds an image for the init container that copies supervisord
 # and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
 # Build with musl (Alpine) for static binary, no glibc dependency.
-FROM golang:1.25-alpine3.22 AS builder
+FROM golang:1.26.1-alpine AS builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
     apk add --no-cache gcc musl-dev
 COPY . /src
@@ -9,7 +9,9 @@ WORKDIR /src
 
 ENV GOPROXY=https://goproxy.cn,direct
 RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord && \
-    CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/exec-in-ns ./cmd/exec-in-ns
+    CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/exec-in-ns ./cmd/exec-in-ns && \
+    CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/cpu-simulator ./cmd/cpu-simulator && \
+    cd ./cmd/procfs-simulator && CGO_ENABLED=0 go build -o /usr/local/bin/procfs-simulator .
 
 # Build static toybox - for sh/cat/ls in redroid (works before init, no apex dependency)
 FROM alpine:3.22.3 AS toybox-builder
@@ -254,6 +256,8 @@ FROM alpine:3.22.3
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
 COPY --from=builder /usr/local/bin/exec-in-ns /usr/local/bin/exec-in-ns
+COPY --from=builder /usr/local/bin/cpu-simulator /usr/local/bin/cpu-simulator
+COPY --from=builder /usr/local/bin/procfs-simulator /usr/local/bin/procfs-simulator
 COPY --from=curl-builder /usr/local/curl-bin/bin/curl /usr/local/bin/curl
 COPY --from=toybox-builder /usr/local/toybox-bin /usr/local/toybox-bin
 COPY --from=busybox-builder /usr/local/busybox /usr/local/busybox

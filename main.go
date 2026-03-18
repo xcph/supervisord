@@ -169,6 +169,9 @@ func main() {
 	if BuildVersion != "" {
 		VERSION = BuildVersion
 	}
+	if handleRunHelper() {
+		return
+	}
 	if handleRunContainer() {
 		return
 	}

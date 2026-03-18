@@ -1,0 +1,20 @@
+# 多架构构建 procfs-simulator（纯 Go，CGO_ENABLED=0）
+# 用法: docker build -f Dockerfile.build --build-arg TARGETARCH=amd64 -t procfs-simulator-builder .
+#       docker run --rm -v $(pwd):/out procfs-simulator-builder
+FROM golang:1.21-bookworm
+ARG TARGETARCH
+ARG TARGETOS=linux
+
+WORKDIR /src
+COPY go.mod *.go ./
+COPY hook-fuse.sh ./
+
+# 纯 Go 构建，无需 libfuse
+ENV CGO_ENABLED=0
+ENV GOOS=${TARGETOS}
+ENV GOARCH=${TARGETARCH}
+RUN go mod download && go build -o procfs-simulator .
+
+# 输出到 /out（运行时挂载）
+RUN mkdir -p /out && cp procfs-simulator hook-fuse.sh /out/
+CMD ["sh", "-c", "cp /src/procfs-simulator /src/hook-fuse.sh /out/ 2>/dev/null || true"]
