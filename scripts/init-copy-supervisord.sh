@@ -39,6 +39,9 @@ if [ -d /usr/local/busybox ]; then
   HAS_UTILS=1
   SH_SHELL="/shared/busybox/bin/sh"
 fi
+# Shell for init wrapper; fallback to /bin/sh when no busybox/toybox
+WRAP_SHELL="${SH_SHELL}"
+[ "$HAS_UTILS" = "0" ] && WRAP_SHELL="/bin/sh"
 
 # Create passwd/group for root
 mkdir -p "$SHARED/etc"
@@ -104,9 +107,9 @@ CPU_SIMULATION_ENABLED="${CPU_SIMULATION_ENABLED:-true}"
   fi
   echo '[program:init]'
   if [ -n "$INIT_ARGS" ]; then
-    echo "command=$INIT_CMD $INIT_ARGS"
+    echo "command=$WRAP_SHELL -c 'exec $INIT_CMD $INIT_ARGS'"
   else
-    echo "command=$INIT_CMD"
+    echo "command=$WRAP_SHELL -c 'exec $INIT_CMD'"
   fi
   echo 'autostart=true'
   echo 'autorestart=true'

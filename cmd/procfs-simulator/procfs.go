@@ -99,14 +99,15 @@ func isRootMountLine(line string) bool {
 	return false
 }
 
-// 默认 overlay 替换值：deviceinfo 等应用用 fstype 构造 ic_device_* 资源名，overlay/rootfs 常无对应 drawable 导致 getIdentifier 返回 0。
-// ext4 为常见存储文件系统类型，设备信息类应用通常预置 ic_device_ext4。
+// 默认 overlay 替换：保持 fstype 为 overlay，仅替换 device 以隐藏容器路径。
+// 反编译结论：deviceinfo 对 overlay 有特殊处理（不触发 getIdentifier），对 ext4/rootfs 等会调用 getIdentifier 且无对应 drawable 导致 Invalid ID。
+// 不用 procfs-simulator 时应用读真实 /proc/mounts 看到 overlay 正常；用 procfs 时若替换为 ext4/rootfs 反而触发崩溃。故保持 fstype=overlay。
 const (
-	defaultOverlayDevice = "/dev/root"
-	defaultOverlayFstype = "ext4"
+	defaultOverlayDevice = "overlay"
+	defaultOverlayFstype = "overlay"
 )
 
-// replaceRootMountLine 将根 overlay 行替换为配置的 device/fstype（未配置时用 rootfs 避免 deviceinfo Invalid ID 0x00000000）
+// replaceRootMountLine 将根 overlay 行替换：隐藏 lowerdir/upperdir 等路径，但保持 fstype 为 overlay 以兼容 deviceinfo
 func replaceRootMountLine(line string, _ string) string {
 	if !strings.Contains(line, "overlay") {
 		return line
