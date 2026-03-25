@@ -10,12 +10,15 @@ This project re-implements supervisord in go-lang. Compiled supervisord is very 
 
 # Dockerfile.init for cloudphone-operator
 
-When using supervisord with cloudphone-operator (init container + emptyDir), you **must** build the image from `Dockerfile.init`, NOT the default `Dockerfile`:
+When using supervisord with cloudphone-operator (init container + emptyDir), you **must** build the image from `Dockerfile.init`, NOT the default `Dockerfile`. The build context must be the **monorepo root** (the directory that contains both `supervisord/` and `cloudphone-nodeagent-api/`), because `go.mod` uses a `replace` to the shared API module:
 
 ```bash
-docker build -f Dockerfile.init -t your-registry/supervisord:v0.0.1 .
+cd /path/to/xcph   # parent of supervisord/ and cloudphone-nodeagent-api/
+docker build -f supervisord/Dockerfile.init -t your-registry/supervisord:v0.0.1 .
 docker push your-registry/supervisord:v0.0.1
 ```
+
+Or from this directory: `make docker-build-init IMAGE=your-registry/supervisord:v0.0.1` (uses `..` as repo root by default).
 
 - **Dockerfile** produces a minimal scratch image (supervisord only) - cannot be used as init container
 - **Dockerfile.init** produces an alpine image with supervisord + init script - required for init container

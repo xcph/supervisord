@@ -25,11 +25,14 @@ func getExecInNsPath() string {
 
 // runExecInNamespace spawns exec-in-ns to join target's user/mnt/pid/net namespaces and exec the command.
 // Uses standalone exec-in-ns binary to avoid supervisord's init chain that reads /proc/self/exe (fails in containers).
+// stdin may be nil when ctl is run without -i (non-interactive one-shot).
 func runExecInNamespace(targetPid int, cmdArgs []string, stdin, stdout, stderr *os.File) error {
 	execInNs := getExecInNsPath()
 	args := append([]string{strconv.Itoa(targetPid)}, cmdArgs...)
 	cmd := exec.Command(execInNs, args...)
-	cmd.Stdin = stdin
+	if stdin != nil {
+		cmd.Stdin = stdin
+	}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd.Run()

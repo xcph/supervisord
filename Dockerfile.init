@@ -1,11 +1,13 @@
 # Dockerfile.init builds an image for the init container that copies supervisord
 # and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
+# Build context must be the monorepo root (parent of supervisord/): it needs supervisord + cloudphone-nodeagent-api for go.mod replace.
 # Build with musl (Alpine) for static binary, no glibc dependency.
 FROM golang:1.26.1-alpine AS builder
 RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
     apk add --no-cache gcc musl-dev
-COPY . /src
-WORKDIR /src
+COPY supervisord /src/supervisord
+COPY cloudphone-nodeagent-api /src/cloudphone-nodeagent-api
+WORKDIR /src/supervisord
 
 ENV GOPROXY=https://goproxy.cn,direct
 RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" -o /usr/local/bin/supervisord github.com/ochinchina/supervisord && \
@@ -201,7 +203,7 @@ RUN wget -q "https://github.com/ngtcp2/ngtcp2/releases/download/v1.20.0/ngtcp2-1
     make -j$(nproc) LDFLAGS="-L/usr/local/curl-deps/lib" && make install && \
     cp -a crypto/includes/ngtcp2/ngtcp2_crypto.h crypto/includes/ngtcp2/ngtcp2_crypto_ossl.h \
         /usr/local/http3/include/ngtcp2/
-COPY libngtcp2_crypto_ossl.pc /usr/local/http3/lib/pkgconfig/libngtcp2_crypto_ossl.pc
+COPY supervisord/libngtcp2_crypto_ossl.pc /usr/local/http3/lib/pkgconfig/libngtcp2_crypto_ossl.pc
 
 # Build static curl: custom deps (OpenSSL 3.6.1 zlib 1.3.1 brotli 1.2.0 zstd 1.5.7
 # libssh2 1.11.1 nghttp2 1.68.0 libidn2 OpenLDAP 2.6.13 krb5-1.22.2) + ngtcp2/nghttp3 for HTTP/3.
@@ -261,7 +263,7 @@ COPY --from=builder /usr/local/bin/procfs-simulator /usr/local/bin/procfs-simula
 COPY --from=curl-builder /usr/local/curl-bin/bin/curl /usr/local/bin/curl
 COPY --from=toybox-builder /usr/local/toybox-bin /usr/local/toybox-bin
 COPY --from=busybox-builder /usr/local/busybox /usr/local/busybox
-COPY scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
-COPY scripts/diag-network-after-init-restart.sh /scripts/diag-network-after-init-restart.sh
+COPY supervisord/scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
+COPY supervisord/scripts/diag-network-after-init-restart.sh /scripts/diag-network-after-init-restart.sh
 RUN chmod +x /init-copy-supervisord.sh /scripts/diag-network-after-init-restart.sh
 ENTRYPOINT ["/init-copy-supervisord.sh"]

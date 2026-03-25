@@ -69,7 +69,10 @@ func main() {
 	// Use PTY when: (1) stdin is TTY, or (2) running interactive shell (no args or shell as cmd).
 	// Ctl may run via RPC so server's stdin is not a TTY; always use PTY for shell to fix "can't set tty process group".
 	// IMPORTANT: PTY must be created AFTER joining target's PID namespace, else tcsetpgrp fails with "No such process".
-	needPty := !inner && (isTTY(int(os.Stdin.Fd())) || isInteractiveShell(cmdArgs))
+	// grpctunnel/cph-agentctl without -t sets EXEC_IN_NS_NO_PTY=1: otherwise shell opens on PTY and blocks
+	// waiting for input while the client has no stdin attached.
+	noPty := os.Getenv("EXEC_IN_NS_NO_PTY") == "1"
+	needPty := !inner && !noPty && (isTTY(int(os.Stdin.Fd())) || isInteractiveShell(cmdArgs))
 	if needPty {
 		if err := runWithPTY(targetPid, cmdArgs); err != nil {
 			fmt.Fprintf(os.Stderr, "exec-in-ns: %v\n", err)
@@ -160,10 +163,14 @@ func joinNamespaces(targetPid int) error {
 	}
 
 	skipOnErr := map[string]bool{"user": true, "cgroup": true}
+	debug := os.Getenv("EXEC_IN_NS_DEBUG") != ""
 	for i, fd := range fds {
 		if err := unix.Setns(fd, nsTypes[i]); err != nil {
 			if skipOnErr[nsNames[i]] && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM)) {
-				fmt.Fprintf(os.Stderr, "exec-in-ns: skip %s ns (setns: %v)\n", nsNames[i], err)
+				// Common in unprivileged containers; avoid stderr noise unless EXEC_IN_NS_DEBUG=1.
+				if debug {
+					fmt.Fprintf(os.Stderr, "exec-in-ns: skip %s ns (setns: %v)\n", nsNames[i], err)
+				}
 				continue
 			}
 			return fmt.Errorf("setns %s: %w", nsNames[i], err)
@@ -190,6 +197,13 @@ func execInNamespaceWithPTY(targetPid int, cmdArgs []string) error {
 	defer ptmx.Close()
 	defer pts.Close()
 
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		_ = pty.InheritSize(os.Stdin, ptmx)
+	} else {
+		// gRPC / pipe stdin is not a TTY: winsize must come from EXEC_IN_NS_ROWS/COLS (see cloudphone ExecHandshake).
+		applyEnvWinsizeToPTMX(ptmx)
+	}
+
 	path, argv := resolveShell(cmdArgs)
 	cmd := exec.Command(path, argv[1:]...)
 	cmd.Env = os.Environ()
@@ -210,7 +224,11 @@ func execInNamespaceWithPTY(targetPid int, cmdArgs []string) error {
 	signal.Notify(ch, syscall.SIGWINCH)
 	go func() {
 		for range ch {
-			_ = pty.InheritSize(os.Stdin, ptmx)
+			if term.IsTerminal(int(os.Stdin.Fd())) {
+				_ = pty.InheritSize(os.Stdin, ptmx)
+			} else {
+				applyEnvWinsizeToPTMX(ptmx)
+			}
 		}
 	}()
 	if term.IsTerminal(int(os.Stdin.Fd())) {
@@ -231,9 +249,23 @@ func execInNamespaceWithPTY(targetPid int, cmdArgs []string) error {
 	return cmd.Wait()
 }
 
+func isShellCommandName(path string) bool {
+	switch filepath.Base(path) {
+	case "sh", "bash", "ash", "ksh":
+		return true
+	default:
+		return false
+	}
+}
+
+// resolveShell maps a bare shell name to a known busybox/system path. It must not run for arbitrary
+// commands: e.g. "ps" with no cwd hit would wrongly become sh + "-ef" and produce no useful output.
 func resolveShell(cmdArgs []string) (path string, argv []string) {
 	path = cmdArgs[0]
-	argv = cmdArgs
+	argv = append([]string(nil), cmdArgs...)
+	if !isShellCommandName(path) {
+		return path, argv
+	}
 	shellFallbacks := []string{"/shared/busybox/bin/sh", "/shared/toybox-bin/sh", "/system/bin/sh", "/bin/sh"}
 	if !pathExists(path) || path == "/system/bin/sh" || path == "/bin/sh" {
 		for _, p := range shellFallbacks {
@@ -256,12 +288,43 @@ func execInNamespace(targetPid int, cmdArgs []string) error {
 	}
 
 	path, argv := resolveShell(cmdArgs)
+	if !filepath.IsAbs(path) {
+		if lp, err := exec.LookPath(path); err == nil {
+			path = lp
+			if len(argv) > 0 {
+				argv[0] = lp
+			}
+		}
+	}
 	return unix.Exec(path, argv, os.Environ())
 }
 
 func pathExists(p string) bool {
 	_, err := os.Stat(p)
 	return err == nil
+}
+
+// applyEnvWinsizeToPTMX sets TIOCSWINSZ when stdin is not a TTY (e.g. grpctunnel pipe).
+func applyEnvWinsizeToPTMX(f *os.File) {
+	rows, cols, ok := winsizeFromEnv()
+	if !ok {
+		rows, cols = 24, 80
+	}
+	_ = pty.Setsize(f, &pty.Winsize{Rows: rows, Cols: cols})
+}
+
+func winsizeFromEnv() (rows, cols uint16, ok bool) {
+	rs := os.Getenv("EXEC_IN_NS_ROWS")
+	cs := os.Getenv("EXEC_IN_NS_COLS")
+	if rs == "" || cs == "" {
+		return 0, 0, false
+	}
+	r, err1 := strconv.Atoi(rs)
+	c, err2 := strconv.Atoi(cs)
+	if err1 != nil || err2 != nil || r <= 0 || c <= 0 || r > 65535 || c > 65535 {
+		return 0, 0, false
+	}
+	return uint16(r), uint16(c), true
 }
 
 func getSelfPath() string {

@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode"
 
@@ -142,7 +144,16 @@ func runServer() {
 		if _, _, _, sErr := s.Reload(true); sErr != nil {
 			panic(sErr)
 		}
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			nodeAgentBridgeLoop(ctx, s)
+		}()
 		s.WaitForExit()
+		cancel()
+		wg.Wait()
 	}
 }
 

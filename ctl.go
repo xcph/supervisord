@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/jessevdk/go-flags"
@@ -56,8 +57,10 @@ type SignalCommand struct {
 type LogtailCommand struct {
 }
 
-// ExecCommand enter program's namespace and run shell or command
+// ExecCommand enter program's namespace and run shell or command (kubectl-exec-like: -i -t, optional -- before command).
 type ExecCommand struct {
+	Stdin bool `short:"i" long:"stdin" description:"Pass stdin to the remote command"`
+	Tty   bool `short:"t" long:"tty" description:"Allocate a pseudo-TTY (interactive shell); implies -i"`
 }
 
 // CmdCheckWrapperCommand A wrapper can be used to check whether
@@ -72,6 +75,24 @@ type CmdCheckWrapperCommand struct {
 	usage string
 }
 
+// execCheckWrapper embeds ExecCommand so go-flags registers -i/-t on the ctl exec subcommand.
+// CmdCheckWrapperCommand{cmd: &ExecCommand{}} hides ExecCommand fields from reflection (lowercase cmd),
+// which caused "supervisord ctl exec -it ..." to fail with unknown flag `i'.
+type execCheckWrapper struct {
+	ExecCommand
+}
+
+const execCmdUsage = "exec [options] <program> [--] [command...]"
+
+func (e *execCheckWrapper) Execute(args []string) error {
+	if len(args) < 1 {
+		err := fmt.Errorf("Invalid arguments.\nUsage: supervisord ctl %s", execCmdUsage)
+		fmt.Printf("%v\n", err)
+		return err
+	}
+	return e.ExecCommand.Execute(args)
+}
+
 var ctlCommand CtlCommand
 var statusCommand = CmdCheckWrapperCommand{&StatusCommand{}, 0, ""}
 var startCommand = CmdCheckWrapperCommand{&StartCommand{}, 0, ""}
@@ -82,7 +103,7 @@ var reloadCommand = CmdCheckWrapperCommand{&ReloadCommand{}, 0, ""}
 var pidCommand = CmdCheckWrapperCommand{&PidCommand{}, 1, "pid <program>"}
 var signalCommand = CmdCheckWrapperCommand{&SignalCommand{}, 2, "signal <signal_name> <program>[...]"}
 var logtailCommand = CmdCheckWrapperCommand{&LogtailCommand{}, 1, "logtail <program>"}
-var execCommand = CmdCheckWrapperCommand{&ExecCommand{}, 1, "exec <program> [command...]"}
+var execWrapper = &execCheckWrapper{}
 
 func (x *CtlCommand) getServerURL() string {
 	options.Configuration, _ = findSupervisordConf()
@@ -310,12 +331,41 @@ func (x *CtlCommand) getPid(rpcc *xmlrpcclient.XMLRPCClient, process string) {
 	}
 }
 
+// splitExecArgs splits program name and command after optional "--" (same idea as kubectl exec).
+func isCtlInteractiveShellArgv(arg string) bool {
+	switch filepath.Base(arg) {
+	case "sh", "bash", "ash", "ksh":
+		return true
+	default:
+		return false
+	}
+}
+
+func splitExecArgs(args []string) (program string, cmdArgs []string) {
+	if len(args) == 0 {
+		return "", nil
+	}
+	for i, a := range args {
+		if a == "--" {
+			if i == 0 {
+				fmt.Fprintf(os.Stderr, "exec: program name must appear before --\n")
+				os.Exit(2)
+			}
+			return args[0], args[i+1:]
+		}
+	}
+	return args[0], args[1:]
+}
+
 // exec enters the program's PID and mount namespace, then runs a command or interactive shell.
-// Usage: exec <program> [command...]
-// If no command is given, starts an interactive bash (or $SHELL).
-// Uses pure Go implementation (no external nsenter dependency).
-func (x *CtlCommand) exec(rpcc *xmlrpcclient.XMLRPCClient, args []string) {
-	program := args[0]
+// Usage: exec [-i] [-t] <program> [--] [command...]
+// With -t and no command, runs $SHELL or /bin/bash. Without -t, a command is required (e.g. exec init -- ls -la).
+func (x *CtlCommand) exec(rpcc *xmlrpcclient.XMLRPCClient, args []string, stdinFlag, ttyFlag bool) {
+	program, cmdArgs := splitExecArgs(args)
+	if program == "" {
+		fmt.Fprintf(os.Stderr, "exec: program name is required\n")
+		os.Exit(2)
+	}
 	procInfo, err := rpcc.GetProcessInfo(program)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "program '%s' not found\n", program)
@@ -325,17 +375,36 @@ func (x *CtlCommand) exec(rpcc *xmlrpcclient.XMLRPCClient, args []string) {
 		fmt.Fprintf(os.Stderr, "program '%s' is not running (pid=0)\n", program)
 		os.Exit(1)
 	}
-	var cmdArgs []string
-	if len(args) == 1 {
-		shell := os.Getenv("SHELL")
-		if shell == "" {
-			shell = "/bin/bash"
-		}
-		cmdArgs = []string{shell}
-	} else {
-		cmdArgs = args[1:]
+
+	useTTY := ttyFlag
+	useStdin := stdinFlag
+	if useTTY && !useStdin {
+		useStdin = true // same as kubectl: -t implies attaching stdin
 	}
-	if err := runExecInNamespace(procInfo.Pid, cmdArgs, os.Stdin, os.Stdout, os.Stderr); err != nil {
+	// Without -i, Go exec gives the child /dev/null for stdin. A lone `sh`/`bash` looks interactive
+	// but cannot read the keyboard — use stdin from the terminal (same idea as `docker run -it`).
+	if !useStdin && len(cmdArgs) == 1 && isCtlInteractiveShellArgv(cmdArgs[0]) {
+		useStdin = true
+	}
+
+	if len(cmdArgs) == 0 {
+		if useTTY {
+			shell := os.Getenv("SHELL")
+			if shell == "" {
+				shell = "/bin/bash"
+			}
+			cmdArgs = []string{shell}
+		} else {
+			fmt.Fprintf(os.Stderr, "exec: use -t for an interactive shell, or pass a command (e.g. exec %s -- ls)\n", program)
+			os.Exit(2)
+		}
+	}
+
+	var stdin *os.File
+	if useStdin {
+		stdin = os.Stdin
+	}
+	if err := runExecInNamespace(procInfo.Pid, cmdArgs, stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
 		os.Exit(1)
 	}
@@ -458,7 +527,7 @@ func (pc *PidCommand) Execute(args []string) error {
 
 // Execute enter program's namespace and run shell or command
 func (ec *ExecCommand) Execute(args []string) error {
-	ctlCommand.exec(ctlCommand.createRPCClient(), args)
+	ctlCommand.exec(ctlCommand.createRPCClient(), args, ec.Stdin, ec.Tty)
 	return nil
 }
 
@@ -556,7 +625,7 @@ func init() {
 		&logtailCommand)
 	ctlCmd.AddCommand("exec",
 		"enter program's namespace and run shell or command",
-		"Enter the program's PID/mount namespace. Run interactive bash if no command given, otherwise run the specified command.",
-		&execCommand)
+		"Like kubectl exec: -i/-t, optional -- then command. A lone sh/bash/ash/ksh attaches stdin automatically. Examples: ctl exec init -- sh ; ctl exec -it init -- /bin/sh ; ctl exec init -- ls -la",
+		execWrapper)
 
 }
