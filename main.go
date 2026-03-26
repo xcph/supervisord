@@ -135,6 +135,8 @@ func findSupervisordConf() (string, error) {
 func runServer() {
 	// infinite loop for handling Restart ('reload' command)
 	loadEnvFile()
+	fmt.Fprintf(os.Stderr, "[supervisord-startup] SUPERVISORD_DEBUG_EXEC=%q EXEC_IN_NS_DEBUG=%q EXEC_IN_NS_PATH=%q\n",
+		os.Getenv("SUPERVISORD_DEBUG_EXEC"), os.Getenv("EXEC_IN_NS_DEBUG"), os.Getenv("EXEC_IN_NS_PATH"))
 	for {
 		if len(options.Configuration) <= 0 {
 			options.Configuration, _ = findSupervisordConf()

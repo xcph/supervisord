@@ -70,11 +70,33 @@ func nodeAgentBridgeLoop(ctx context.Context, sup *Supervisor) {
 	}
 }
 
+func waitForUnixSocket(ctx context.Context, path string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for unix socket %q (is node-agent running?)", path)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
 func runReverseTunnelSession(
 	ctx context.Context,
 	sup *Supervisor,
 	sock, token, podUID, podName, ns, nodeName string,
 ) error {
+	// node-agent removes/recreates the socket on restart; wait so we do not spin on ENOENT forever in tight loops.
+	if err := waitForUnixSocket(ctx, sock, 90*time.Second); err != nil {
+		return err
+	}
 	conn, err := grpc.NewClient(
 		"unix://"+sock,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

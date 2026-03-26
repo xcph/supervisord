@@ -8,6 +8,7 @@
 package main
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -17,12 +18,22 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/creack/pty"
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
+
+func debugEnabled(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
 
 // Linux namespace constants (from syscall package, not always in unix)
 const (
@@ -35,6 +46,14 @@ const (
 	cloneNewCgroup = 0x02000000
 	cloneFS        = 0x00000200
 )
+
+type exitCodeError struct {
+	code int
+}
+
+func (e exitCodeError) Error() string {
+	return fmt.Sprintf("exit status %d", e.code)
+}
 
 func main() {
 	args := os.Args[1:]
@@ -75,6 +94,17 @@ func main() {
 	needPty := !inner && !noPty && (isTTY(int(os.Stdin.Fd())) || isInteractiveShell(cmdArgs))
 	if needPty {
 		if err := runWithPTY(targetPid, cmdArgs); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				os.Exit(exitErr.ExitCode())
+			}
+			var codeErr exitCodeError
+			if errors.As(err, &codeErr) {
+				os.Exit(codeErr.code)
+			}
+			if isCommandNotFoundErr(err) {
+				os.Exit(127)
+			}
 			fmt.Fprintf(os.Stderr, "exec-in-ns: %v\n", err)
 			os.Exit(1)
 		}
@@ -82,6 +112,17 @@ func main() {
 	}
 	if inner && usePty {
 		if err := execInNamespaceWithPTY(targetPid, cmdArgs); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				os.Exit(exitErr.ExitCode())
+			}
+			var codeErr exitCodeError
+			if errors.As(err, &codeErr) {
+				os.Exit(codeErr.code)
+			}
+			if isCommandNotFoundErr(err) {
+				os.Exit(127)
+			}
 			fmt.Fprintf(os.Stderr, "exec-in-ns: %v\n", err)
 			os.Exit(1)
 		}
@@ -92,9 +133,27 @@ func main() {
 		if errors.As(err, &exitErr) {
 			os.Exit(exitErr.ExitCode())
 		}
+		var codeErr exitCodeError
+		if errors.As(err, &codeErr) {
+			os.Exit(codeErr.code)
+		}
+		if isCommandNotFoundErr(err) {
+			os.Exit(127)
+		}
 		fmt.Fprintf(os.Stderr, "exec-in-ns: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+func isCommandNotFoundErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "executable file not found") || strings.Contains(s, "file not found in $path")
 }
 
 func isTTY(fd int) bool {
@@ -137,7 +196,10 @@ func runWithPTY(targetPid int, cmdArgs []string) error {
 		}
 		defer func() { _ = term.Restore(int(os.Stdin.Fd()), oldState) }()
 	}
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return waitWithProcessState(cmd)
 }
 
 func joinNamespaces(targetPid int) error {
@@ -167,7 +229,7 @@ func joinNamespaces(targetPid int) error {
 	}
 
 	skipOnErr := map[string]bool{"user": true, "cgroup": true}
-	debug := os.Getenv("EXEC_IN_NS_DEBUG") != ""
+	debug := debugEnabled(os.Getenv("EXEC_IN_NS_DEBUG"))
 	for i, fd := range fds {
 		if err := unix.Setns(fd, nsTypes[i]); err != nil {
 			if skipOnErr[nsNames[i]] && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM)) {
@@ -206,6 +268,10 @@ func execInNamespaceWithPTY(targetPid int, cmdArgs []string) error {
 	} else {
 		// gRPC / pipe stdin is not a TTY: winsize must come from EXEC_IN_NS_ROWS/COLS (see cloudphone ExecHandshake).
 		applyEnvWinsizeToPTMX(ptmx)
+	}
+	stopResize := startResizeFIFOWatcher(ptmx)
+	if stopResize != nil {
+		defer stopResize()
 	}
 
 	path, argv := resolveShell(cmdArgs)
@@ -250,7 +316,45 @@ func execInNamespaceWithPTY(targetPid int, cmdArgs []string) error {
 
 	go func() { _, _ = io.Copy(ptmx, os.Stdin) }()
 	_, _ = io.Copy(os.Stdout, ptmx)
-	return cmd.Wait()
+	return waitWithProcessState(cmd)
+}
+
+func startResizeFIFOWatcher(ptmx *os.File) func() {
+	p := os.Getenv("EXEC_IN_NS_RESIZE_FIFO")
+	if p == "" {
+		return nil
+	}
+	f, err := os.OpenFile(p, os.O_RDONLY, 0)
+	if err != nil {
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer f.Close()
+		rd := bufio.NewReader(f)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			line, rerr := rd.ReadString('\n')
+			if rerr != nil {
+				if errors.Is(rerr, io.EOF) {
+					continue
+				}
+				return
+			}
+			var rows, cols int
+			if _, serr := fmt.Sscanf(line, "%d %d", &rows, &cols); serr == nil && rows > 0 && cols > 0 {
+				err := pty.Setsize(ptmx, &pty.Winsize{Rows: uint16(rows), Cols: uint16(cols)})
+				if debugEnabled(os.Getenv("EXEC_IN_NS_DEBUG")) {
+					fmt.Fprintf(os.Stderr, "exec-in-ns: resize rows=%d cols=%d err=%v\n", rows, cols, err)
+				}
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 func isShellCommandName(path string) bool {
@@ -308,7 +412,27 @@ func execInNamespace(targetPid int, cmdArgs []string) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Env = os.Environ()
-	return cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	return waitWithProcessState(cmd)
+}
+
+func waitWithProcessState(cmd *exec.Cmd) error {
+	err := cmd.Wait()
+	if err == nil {
+		return nil
+	}
+	if cmd != nil && cmd.ProcessState != nil {
+		if ec := cmd.ProcessState.ExitCode(); ec >= 0 {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr
+			}
+			return exitCodeError{code: ec}
+		}
+	}
+	return err
 }
 
 func pathExists(p string) bool {
