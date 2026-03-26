@@ -88,6 +88,10 @@ func main() {
 		return
 	}
 	if err := execInNamespace(targetPid, cmdArgs); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			os.Exit(exitErr.ExitCode())
+		}
 		fmt.Fprintf(os.Stderr, "exec-in-ns: %v\n", err)
 		os.Exit(1)
 	}
@@ -296,7 +300,15 @@ func execInNamespace(targetPid int, cmdArgs []string) error {
 			}
 		}
 	}
-	return unix.Exec(path, argv, os.Environ())
+	// 使用 fork+exec，不用 unix.Exec 直接替换当前进程：在 setns 进入目标 PID 命名空间后，
+	// 部分 Android/toybox 对「由宿主进程 setns 再 execve 得到」的进程上 stat("/proc/self/exe") 会失败；
+	// 带 -t 时走 execInNamespaceWithPTY（子进程 exec）则正常。子进程在命名空间内原生 fork 可避免该问题。
+	cmd := exec.Command(path, argv[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Env = os.Environ()
+	return cmd.Run()
 }
 
 func pathExists(p string) bool {

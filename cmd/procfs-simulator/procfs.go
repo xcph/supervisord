@@ -396,7 +396,15 @@ func (s *procSymlink) Readlink(ctx context.Context) ([]byte, syscall.Errno) {
 }
 
 func (s *procSymlink) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	return getattrNode(s.realPath, out)
+	// 必须用 Lstat：/proc/<pid>/exe、cwd、root 等指向进程命名空间内路径，
+	// Stat 会解析到目标文件；FUSE 守护进程在宿主机命名空间中常无法访问该目标，
+	// 表现为 ENOENT（如 toybox getprop stat("/proc/self/exe")）。
+	var st syscall.Stat_t
+	if err := syscall.Lstat(s.realPath, &st); err != nil {
+		return fs.ToErrno(err)
+	}
+	out.FromStat(&st)
+	return 0
 }
 
 func getattrNode(path string, out *fuse.AttrOut) syscall.Errno {
