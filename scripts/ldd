@@ -1,0 +1,33 @@
+#!/bin/sh
+# ldd: BusyBox static image has no ldd applet; delegate to toybox readelf (DT_NEEDED).
+readelf_cmd=
+for d in /shared/toybox-bin/readelf /usr/local/toybox-bin/readelf; do
+	if [ -x "$d" ]; then readelf_cmd=$d; break; fi
+done
+if [ -z "$readelf_cmd" ]; then
+	echo "ldd: toybox readelf not found" >&2
+	exit 127
+fi
+if [ "$#" -lt 1 ]; then
+	echo "usage: ldd <file>" >&2
+	exit 1
+fi
+f=$1
+if [ ! -r "$f" ] && [ ! -x "$f" ]; then
+	echo "ldd: $f: No such file" >&2
+	exit 1
+fi
+out=$("$readelf_cmd" -d "$f" 2>&1) || {
+	echo "ldd: $f: readelf failed" >&2
+	exit 1
+}
+case "$out" in
+*'no dynamic section'*)
+	echo "	statically linked"
+	exit 0
+	;;
+esac
+echo "$out" | grep -E 'NEEDED|Shared library' | sed -n 's/.*\[\([^]]*\)\].*/\1/p' | while read -r lib; do
+	[ -n "$lib" ] && printf '\t%s => not found\n' "$lib"
+done
+exit 0

@@ -250,9 +250,56 @@ RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busyb
     sed -i 's/CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' .config && \
     sed -i 's/CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' .config && \
     sed -i 's/CONFIG_TC=y/# CONFIG_TC is not set/' .config && \
+    sed -i 's/# CONFIG_NSLOOKUP is not set/CONFIG_NSLOOKUP=y/' .config && \
+    sed -i 's/CONFIG_NSLOOKUP=n/CONFIG_NSLOOKUP=y/' .config && \
     yes "" | make oldconfig && \
     make -j$(nproc) && \
     make install CONFIG_PREFIX=/usr/local/busybox
+
+# Static ldns drill + dig symlink: BusyBox has nslookup (CONFIG_NSLOOKUP) but no dig applet; drill is dig-like (ldns).
+FROM alpine:3.22.3 AS ldns-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev linux-headers perl openssl-dev openssl-libs-static zlib-static
+RUN wget -q "https://nlnetlabs.nl/downloads/ldns/ldns-1.8.4.tar.gz" -O /tmp/ldns.tar.gz && \
+    tar xzf /tmp/ldns.tar.gz -C /tmp && cd /tmp/ldns-1.8.4 && \
+    PKG_CONFIG_PATH=/usr/lib/pkgconfig \
+    LDFLAGS="-static" \
+    ./configure --prefix=/usr/local/ldns --disable-shared \
+        --with-ssl=/usr --with-drill && \
+    make -j$(nproc) && \
+    make install && \
+    gcc -static -o /usr/local/ldns/bin/drill \
+        drill/*.o compat/b64_pton.o compat/b64_ntop.o .libs/libldns.a -lssl -lcrypto -lz && \
+    strip /usr/local/ldns/bin/drill
+
+# Build static strace and place into busybox bin.
+FROM alpine:3.22.3 AS strace-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev linux-headers
+RUN wget -q "https://github.com/strace/strace/releases/download/v6.10/strace-6.10.tar.xz" -O /tmp/strace.tar.xz && \
+    tar xJf /tmp/strace.tar.xz -C /tmp && \
+    cd /tmp/strace-6.10 && \
+    ./configure --disable-shared --enable-static --enable-mpers=no --enable-bundled=yes --prefix=/usr/local/strace && \
+    make -j$(nproc) LDFLAGS="-static" && \
+    make install
+
+# Build static tcpdump (with static libpcap) and place into busybox bin.
+FROM alpine:3.22.3 AS tcpdump-builder
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+    apk add --no-cache wget make gcc musl-dev linux-headers flex bison
+RUN wget -q "https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz" -O /tmp/libpcap.tar.gz && \
+    tar xzf /tmp/libpcap.tar.gz -C /tmp && \
+    cd /tmp/libpcap-1.10.5 && \
+    ./configure --disable-shared --enable-static --prefix=/usr/local/tcpdump-deps && \
+    make -j$(nproc) && \
+    make install && \
+    wget -q "https://www.tcpdump.org/release/tcpdump-4.99.5.tar.gz" -O /tmp/tcpdump.tar.gz && \
+    tar xzf /tmp/tcpdump.tar.gz -C /tmp && \
+    cd /tmp/tcpdump-4.99.5 && \
+    CPPFLAGS="-I/usr/local/tcpdump-deps/include" LDFLAGS="-L/usr/local/tcpdump-deps/lib -static" \
+    ./configure --disable-shared --enable-static --prefix=/usr/local/tcpdump && \
+    make -j$(nproc) && \
+    make install
 
 FROM alpine:3.22.3
 RUN apk add --no-cache ca-certificates
@@ -263,6 +310,12 @@ COPY --from=builder /usr/local/bin/procfs-simulator /usr/local/bin/procfs-simula
 COPY --from=curl-builder /usr/local/curl-bin/bin/curl /usr/local/bin/curl
 COPY --from=toybox-builder /usr/local/toybox-bin /usr/local/toybox-bin
 COPY --from=busybox-builder /usr/local/busybox /usr/local/busybox
+COPY --from=ldns-builder /usr/local/ldns/bin/drill /usr/local/busybox/bin/drill
+COPY --from=strace-builder /usr/local/strace/bin/strace /usr/local/busybox/bin/strace
+COPY --from=tcpdump-builder /usr/local/tcpdump/bin/tcpdump /usr/local/busybox/bin/tcpdump
+RUN chmod +x /usr/local/busybox/bin/drill && ln -sf drill /usr/local/busybox/bin/dig
+COPY supervisord/scripts/ldd /usr/local/busybox/bin/ldd
+RUN chmod +x /usr/local/busybox/bin/ldd
 COPY supervisord/scripts/init-copy-supervisord.sh /init-copy-supervisord.sh
 COPY supervisord/scripts/diag-network-after-init-restart.sh /scripts/diag-network-after-init-restart.sh
 RUN chmod +x /init-copy-supervisord.sh /scripts/diag-network-after-init-restart.sh

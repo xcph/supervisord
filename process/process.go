@@ -784,6 +784,14 @@ func (p *Process) setEnv() {
 	} else {
 		p.cmd.Env = mergeKeyValueArrays(p.cmd.Env, os.Environ())
 	}
+	// Persist resolv.conf in supervisord namespace to shared path.
+	// The container-run helper (init namespace) reads /shared/etc/resolv.conf and writes to /system/etc/resolv.conf.
+	if p.config.GetBool("container_run", false) {
+		if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
+			_ = os.MkdirAll("/shared/etc", 0755)
+			_ = os.WriteFile("/shared/etc/resolv.conf", data, 0644)
+		}
+	}
 }
 
 // 辅助函数：带覆盖的环境变量追加

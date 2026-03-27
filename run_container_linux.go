@@ -112,6 +112,7 @@ func runHelperDelayedTasks() {
 	mountCpusetAfterInitDevReady()
 	time.Sleep(3 * time.Second)
 	restoreCalicoDefaultRoute()
+	writeSystemResolvConfAfterBootCompleted()
 	runProcfsSimulatorAfterInit()
 	ensureTombstonesWritable()
 }
@@ -322,6 +323,46 @@ func unmountForInitRestart() {
 
 	// 3. Restore Calico default route. When init/netd dies, it may flush policy routing; Calico uses 169.254.1.1.
 	restoreCalicoDefaultRoute()
+}
+
+// writeSystemResolvConf copies /shared/etc/resolv.conf into /system/etc/resolv.conf.
+// Best effort: do not block init startup when write fails.
+func writeSystemResolvConf() {
+	const (
+		src = "/shared/etc/resolv.conf"
+		dst = "/system/etc/resolv.conf"
+	)
+	data, err := os.ReadFile(src)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: read %s: %v\n", src, err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: mkdir %s: %v\n", filepath.Dir(dst), err)
+		return
+	}
+
+	// Write directly to destination because overlay/bind mounts may reject rename.
+	if err := os.WriteFile(dst, data, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: write %s: %v\n", dst, err)
+		return
+	}
+}
+
+// writeSystemResolvConfAfterBootCompleted waits until Android boot is completed
+// and then writes /system/etc/resolv.conf.
+func writeSystemResolvConfAfterBootCompleted() {
+	const propPath = "/dev/__properties__/u:object_r:boot_status_prop:s0"
+	const maxWait = 5 * time.Minute
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		time.Sleep(2 * time.Second)
+		if isBootCompletedFromPropertyFile(propPath) {
+			writeSystemResolvConf()
+			return
+		}
+	}
+	fmt.Fprintf(os.Stderr, "run_container: skip writing /system/etc/resolv.conf (boot_completed timeout)\n")
 }
 
 // mountSysfsWithSimulatedCpu overlays simulated CPU data from cpu-simulator onto /sys.

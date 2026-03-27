@@ -32,8 +32,8 @@ if [ -d /usr/local/busybox ]; then
   mkdir -p "$SHARED/busybox"
   cp -a /usr/local/busybox/. "$SHARED/busybox/"
   chmod -R a+x "$SHARED/busybox"
-  # Ensure nc and telnet symlinks exist (busybox applets)
-  for cmd in nc netcat telnet; do
+  # Ensure nc, telnet, nslookup symlinks exist (busybox applets; ldd is a script → toybox readelf)
+  for cmd in nc netcat telnet nslookup; do
     [ ! -e "$SHARED/busybox/bin/$cmd" ] && ln -sf busybox "$SHARED/busybox/bin/$cmd"
   done
   HAS_UTILS=1
