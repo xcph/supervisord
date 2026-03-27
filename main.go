@@ -191,7 +191,17 @@ func main() {
 	if handleExecInNs() {
 		return
 	}
-	ReapZombie()
+	enableZombieReaper := false
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUPERVISORD_ENABLE_ZOMBIE_REAPER"))) {
+	case "1", "true", "yes", "on":
+		enableZombieReaper = true
+	}
+	if enableZombieReaper {
+		ReapZombie()
+		fmt.Fprintln(os.Stderr, "[supervisord-startup] zombie reaper enabled (SUPERVISORD_ENABLE_ZOMBIE_REAPER=1)")
+	} else {
+		fmt.Fprintln(os.Stderr, "[supervisord-startup] zombie reaper disabled (single-waiter mode)")
+	}
 
 	// when execute `supervisord` without sub-command, it should start the server
 	parser.Command.SubcommandsOptional = true

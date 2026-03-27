@@ -168,6 +168,14 @@ func (t *tunnelServer) ExecStream(stream grpc.BidiStreamingServer[nodeagentv1.Ex
 		if e == nil || errors.Is(e, io.EOF) {
 			return
 		}
+		// Closing pipes during teardown can surface benign read/send errors; ignore them.
+		if errors.Is(e, os.ErrClosed) {
+			return
+		}
+		es := strings.ToLower(e.Error())
+		if strings.Contains(es, "file already closed") || strings.Contains(es, "use of closed file") {
+			return
+		}
 		copyMu.Lock()
 		if copyErr == nil {
 			copyErr = e
@@ -298,21 +306,55 @@ func (t *tunnelServer) ExecStream(stream grpc.BidiStreamingServer[nodeagentv1.Ex
 		}
 	}()
 
-	wg.Wait()
+	// Use native wait4 on pid instead of cmd.Wait to avoid occasional delayed
+	// wakeups/no-child races observed in this runtime chain.
+	type waitResult struct {
+		code int32
+		msg  string
+	}
+	waitCh := make(chan waitResult, 1)
+	go func(pid int) {
+		var st unix.WaitStatus
+		_, err := unix.Wait4(pid, &st, 0, nil)
+		if err != nil {
+			waitCh <- waitResult{code: -1, msg: err.Error()}
+			return
+		}
+		if st.Exited() {
+			waitCh <- waitResult{code: int32(st.ExitStatus()), msg: ""}
+			return
+		}
+		if st.Signaled() {
+			waitCh <- waitResult{code: int32(128 + int(st.Signal())), msg: ""}
+			return
+		}
+		waitCh <- waitResult{code: -1, msg: ""}
+	}(cmd.Process.Pid)
+	copyDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(copyDone)
+	}()
+
+	debugExecf("waiting exec-in-ns process pid=%d", cmd.Process.Pid)
+	wr := <-waitCh
+	// Child exited (or fallback decided). Proactively close pipes to unblock copy goroutines.
+	_ = stdoutPipe.Close()
+	_ = stderrPipe.Close()
+	select {
+	case <-copyDone:
+	case <-time.After(300 * time.Millisecond):
+		debugExecf("copy goroutines wait timeout after child exit pid=%d", cmd.Process.Pid)
+	}
 
 	copyMu.Lock()
 	ce := copyErr
 	copyMu.Unlock()
-
 	if ce != nil {
-		if errors.Is(ce, io.EOF) {
-			return nil
-		}
-		_ = cmd.Process.Kill()
+		debugExecf("exec stream copy error after wait: %v", ce)
 	}
-
-	w := cmd.Wait()
-	code, msg := exitFromWaitErr(cmd, w)
+	code, msg := wr.code, wr.msg
+	debugExecf("exec-in-ns wait finished pid=%d code=%d msg=%q", cmd.Process.Pid, code, msg)
 	// Compatibility fallback for older exec-in-ns binaries that return 1 on
 	// command-not-found, while shell semantics expect 127.
 	if code == 1 {
@@ -323,11 +365,24 @@ func (t *tunnelServer) ExecStream(stream grpc.BidiStreamingServer[nodeagentv1.Ex
 		}
 	}
 	if ce != nil {
+		debugExecf("send done with copy error: %v", ce)
 		_ = stream.Send(&nodeagentv1.ExecChunk{Chunk: &nodeagentv1.ExecChunk_Done{Done: &nodeagentv1.ExecDone{ExitCode: -1, ErrorMessage: ce.Error()}}})
 		return ce
 	}
+	debugExecf("send done exitCode=%d errMsg=%q", code, msg)
 	_ = stream.Send(&nodeagentv1.ExecChunk{Chunk: &nodeagentv1.ExecChunk_Done{Done: &nodeagentv1.ExecDone{ExitCode: code, ErrorMessage: msg}}})
 	return nil
+}
+
+func processIsGone(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	err := unix.Kill(pid, 0)
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, unix.ESRCH)
 }
 
 // exitFromWaitErr maps cmd.Wait result to exit code.
@@ -343,10 +398,18 @@ func exitFromWaitErr(cmd *exec.Cmd, w error) (code int32, msg string) {
 	}
 	if isWaitNoChildErr(w) {
 		// Rare race: wait reports no child although process already exited.
+		// Treat it as clean exit by default to avoid surfacing noisy stderr text
+		// like "waitid: no child processes" to interactive clients.
+		if cmd != nil && len(cmd.Args) > 0 {
+			if base := filepath.Base(cmd.Args[0]); base == "sh" || base == "bash" || base == "ash" || base == "ksh" {
+				return 0, ""
+			}
+		}
 		// Try to infer a deterministic code for common shell-form command.
 		if ec, ok := inferExitCodeFromCmdArgs(cmd); ok {
 			return int32(ec), ""
 		}
+		return 0, ""
 	}
 	var exitErr *exec.ExitError
 	if errors.As(w, &exitErr) {
