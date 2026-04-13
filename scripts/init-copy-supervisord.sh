@@ -43,13 +43,9 @@ fi
 WRAP_SHELL="${SH_SHELL}"
 [ "$HAS_UTILS" = "0" ] && WRAP_SHELL="/bin/sh"
 
-# Create passwd/group for root
-mkdir -p "$SHARED/etc"
-printf '%s\n' "root:x:0:0:root:/root:$SH_SHELL" > "$SHARED/etc/passwd"
-# Copy CA certs for curl (default: --with-ca-bundle=/shared/etc/ssl/certs/ca-certificates.crt)
+# CA bundle for curl in shared tree (no Kubernetes mount onto /etc/passwd).
 mkdir -p "$SHARED/etc/ssl/certs"
 [ -f /etc/ssl/certs/ca-certificates.crt ] && cp -f /etc/ssl/certs/ca-certificates.crt "$SHARED/etc/ssl/certs/"
-printf '%s\n' 'root:x:0:' > "$SHARED/etc/group"
 sync
 
 # Write supervisord.conf
@@ -88,19 +84,19 @@ CPU_SIMULATION_ENABLED="${CPU_SIMULATION_ENABLED:-true}"
     echo 'stderr_logfile_maxbytes=0'
     echo ''
   fi
+  echo '# Write /etc/passwd and /etc/group in the main container (no volume mount; avoids containerd SubPath + symlink issues on redroid).'
+  echo '[program:setup-etc]'
+  echo "command=$WRAP_SHELL -c \"mkdir -p /etc /root; echo \\\"root:x:0:0:root:/root:$SH_SHELL\\\" > /etc/passwd; echo \\\"root:x:0:\\\" > /etc/group\""
+  echo 'autostart=true'
+  echo 'autorestart=false'
+  echo 'startsecs=0'
+  echo 'priority=1'
+  echo 'stdout_logfile=/dev/stdout'
+  echo 'stdout_logfile_maxbytes=0'
+  echo 'stderr_logfile=/dev/stderr'
+  echo 'stderr_logfile_maxbytes=0'
+  echo ''
   if [ "$HAS_UTILS" = 1 ]; then
-    echo '# Ensure /etc/passwd, /etc/group, /root (fix su/id; su needs root home dir)'
-    echo '[program:setup-etc]'
-    echo "command=$SH_SHELL -c \"mkdir -p /etc /root; echo \\\"root:x:0:0:root:/root:$SH_SHELL\\\" > /etc/passwd; echo \\\"root:x:0:\\\" > /etc/group\""
-    echo 'autostart=true'
-    echo 'autorestart=false'
-    echo 'startsecs=0'
-    echo 'priority=1'
-    echo 'stdout_logfile=/dev/stdout'
-    echo 'stdout_logfile_maxbytes=0'
-    echo 'stderr_logfile=/dev/stderr'
-    echo 'stderr_logfile_maxbytes=0'
-    echo ''
     echo '[program-default]'
     echo 'environment=PATH="/shared/bin:/shared/supervisord:/shared/busybox/bin:/shared/toybox-bin:/bin:/usr/bin:/system/bin",SUPERVISORD_PATH="/shared/supervisord/supervisord",EXEC_IN_NS_PATH="/shared/supervisord/exec-in-ns"'
     echo ''
