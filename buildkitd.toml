@@ -1,0 +1,21 @@
+debug = true
+
+# 内网 Harbor：证书无 SAN / 自签等导致 Go 报 x509 not standards compliant 时，BuildKit 需显式 insecure。
+# 仅建议隔离内网使用; 根治请换带 SAN 的合规 TLS 证书。
+# 若需 Harbor 自签 CA，可在对应 [registry."..."] 段增加 ca = ["certs/harbor-ca.crt"] 并在构建上下文中放置证书文件。
+# 推镜像若报 token Post "https://.../service/token": EOF，多为仓库实际为 HTTP，需 http = true。
+# 若 Harbor 为 HTTPS（仅自签证书），请删除下行 http = true，仅保留 insecure = true。
+[registry."registry.k8s.local:10443"]
+  insecure = true
+  http = true
+
+[dns]
+  nameservers = ["10.0.0.1"]
+
+[registry."docker.io"]
+  mirrors = [
+    "https://hub.mirrorify.net",
+    "https://docker.1ms.run",
+    "https://dockerproxy.net",
+    "https://hub3.nat.tf"
+  ]

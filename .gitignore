@@ -1,4 +1,8 @@
 .idea
+.buildkitd.effective.toml
+.buildkitd.endpoint.prev
+.buildkitd.config.prev
+.docker-config.buildkit
 supervisord
 supervisord.exe
 test.log*

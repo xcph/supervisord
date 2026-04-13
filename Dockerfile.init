@@ -1,9 +1,26 @@
+# syntax=docker/dockerfile:1
+# 多架构 / 跨平台：使用 supervisord/Makefile 中 docker-build、docker-buildx（BuildKit + buildx）。
+# 本文件大量阶段在目标平台执行原生 gcc/musl 编译；与宿主机架构不同时依赖 buildx 的 QEMU 仿真或同架构构建节点。
+# Alpine apk 源：默认 dl-cdn（跨架构/QEMU 下 USTC 等国内镜像偶发 TLS EOF）。国内直连可构建时传：
+#   --build-arg ALPINE_APK_REPO_HOST=mirrors.ustc.edu.cn
+#   或 make docker-build ALPINE_APK_REPO_HOST=mirrors.ustc.edu.cn
+# 构建期走代理：对 apk / wget / go module 等生效，传 --build-arg HTTP_PROXY=... HTTPS_PROXY=...
+# 或 shell 中 export 后 make；Makefile 亦会将非空的 HTTP(S)_PROXY/NO_PROXY（及小写形式）传给 buildx。
 # Dockerfile.init builds an image for the init container that copies supervisord
 # and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
 # Build context must be the monorepo root (parent of supervisord/): it needs supervisord + cloudphone-nodeagent-api for go.mod replace.
 # Build with musl (Alpine) for static binary, no glibc dependency.
 FROM golang:1.26.1-alpine AS builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache gcc musl-dev
 COPY supervisord /src/supervisord
 COPY cloudphone-nodeagent-api /src/cloudphone-nodeagent-api
@@ -17,9 +34,18 @@ RUN CGO_ENABLED=1 go build -a -ldflags "-linkmode external -extldflags -static" 
 
 # Build static toybox - for sh/cat/ls in redroid (works before init, no apex dependency)
 FROM alpine:3.22.3 AS toybox-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev linux-headers openssl-dev zlib-dev bash
-RUN wget -q "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/toybox.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/toybox.tar.gz && \
     tar xzf /tmp/toybox.tar.gz -C /tmp && \
     cd /tmp/toybox-0.8.13 && \
     make defconfig && \
@@ -39,16 +65,34 @@ RUN wget -q "https://landley.net/toybox/downloads/toybox-0.8.13.tar.gz" -O /tmp/
 # === Custom deps for curl (version >= user spec) ===
 # OpenSSL 3.6.1
 FROM alpine:3.22.3 AS openssl-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev perl linux-headers
-RUN wget -q "https://github.com/openssl/openssl/releases/download/openssl-3.6.1/openssl-3.6.1.tar.gz" -O /tmp/openssl.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/openssl/openssl/releases/download/openssl-3.6.1/openssl-3.6.1.tar.gz" -O /tmp/openssl.tar.gz && \
     tar xzf /tmp/openssl.tar.gz -C /tmp && cd /tmp/openssl-3.6.1 && \
     ./config --prefix=/usr/local/curl-deps no-shared -fPIC && \
     make -j$(nproc) && make install_sw install_ssldirs
 
 # zlib 1.3.1 (>=1.2.12, use Alpine pkg - source build has musl issues)
 FROM alpine:3.22.3 AS zlib-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache zlib-dev zlib-static
 RUN mkdir -p /usr/local/curl-deps/lib /usr/local/curl-deps/include /usr/local/curl-deps/lib/pkgconfig && \
     cp -a /usr/lib/libz.a /usr/local/curl-deps/lib/ && \
@@ -58,18 +102,36 @@ RUN mkdir -p /usr/local/curl-deps/lib /usr/local/curl-deps/include /usr/local/cu
 
 # nghttp2 1.68.0
 FROM alpine:3.22.3 AS nghttp2-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev autoconf automake libtool pkgconfig
-RUN wget -q "https://github.com/nghttp2/nghttp2/releases/download/v1.68.0/nghttp2-1.68.0.tar.gz" -O /tmp/nghttp2.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/nghttp2/nghttp2/releases/download/v1.68.0/nghttp2-1.68.0.tar.gz" -O /tmp/nghttp2.tar.gz && \
     tar xzf /tmp/nghttp2.tar.gz -C /tmp && cd /tmp/nghttp2-1.68.0 && \
     ./configure --prefix=/usr/local/curl-deps --enable-lib-only --disable-shared && \
     make -j$(nproc) && make install
 
 # brotli 1.2.0
 FROM alpine:3.22.3 AS brotli-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget cmake make gcc musl-dev
-RUN wget -q "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz" -O /tmp/brotli.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz" -O /tmp/brotli.tar.gz && \
     tar xzf /tmp/brotli.tar.gz -C /tmp && cd /tmp/brotli-1.2.0 && mkdir build && cd build && \
     cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local/curl-deps -DBUILD_SHARED_LIBS=OFF \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
@@ -77,31 +139,58 @@ RUN wget -q "https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz" -
 
 # zstd 1.5.7
 FROM alpine:3.22.3 AS zstd-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev
-RUN wget -q "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz" -O /tmp/zstd.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz" -O /tmp/zstd.tar.gz && \
     tar xzf /tmp/zstd.tar.gz -C /tmp && cd /tmp/zstd-1.5.7 && \
     make -j$(nproc) -C lib && \
     make -C lib install PREFIX=/usr/local/curl-deps
 
 # libidn2 (AppleIDN, needs libunistring from Alpine)
 FROM alpine:3.22.3 AS libidn2-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev autoconf automake libtool gettext-dev libunistring-dev libunistring-static
-RUN wget -q "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.7.tar.gz" -O /tmp/libidn2.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.7.tar.gz" -O /tmp/libidn2.tar.gz && \
     tar xzf /tmp/libidn2.tar.gz -C /tmp && cd /tmp/libidn2-2.3.7 && \
     ./configure --prefix=/usr/local/curl-deps --disable-shared --disable-doc && \
     make -j$(nproc) && make install
 
 # libssh2 1.11.1 (needs OpenSSL + zlib)
 FROM alpine:3.22.3 AS libssh2-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev autoconf automake libtool
 COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
 COPY --from=zlib-builder /usr/local/curl-deps /tmp/zlib-deps
 RUN cp -a /tmp/zlib-deps/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
     cp -a /tmp/zlib-deps/include/* /usr/local/curl-deps/include/ 2>/dev/null || true
-RUN wget -q "https://www.libssh2.org/download/libssh2-1.11.1.tar.gz" -O /tmp/libssh2.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://www.libssh2.org/download/libssh2-1.11.1.tar.gz" -O /tmp/libssh2.tar.gz && \
     tar xzf /tmp/libssh2.tar.gz -C /tmp && cd /tmp/libssh2-1.11.1 && \
     ./configure --prefix=/usr/local/curl-deps --with-openssl --with-zlib \
         --disable-shared LDFLAGS="-L/usr/local/curl-deps/lib" CPPFLAGS="-I/usr/local/curl-deps/include" && \
@@ -109,10 +198,19 @@ RUN wget -q "https://www.libssh2.org/download/libssh2-1.11.1.tar.gz" -O /tmp/lib
 
 # OpenLDAP 2.6.13 (client libs only, for curl LDAP/LDAPS)
 FROM alpine:3.22.3 AS openldap-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev groff
 COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
-RUN wget -q "https://www.openldap.org/software/download/OpenLDAP/openldap-release/openldap-2.6.13.tgz" -O /tmp/openldap.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://www.openldap.org/software/download/OpenLDAP/openldap-release/openldap-2.6.13.tgz" -O /tmp/openldap.tar.gz && \
     tar xzf /tmp/openldap.tar.gz -C /tmp && cd /tmp/openldap-2.6.13 && \
     CPPFLAGS="-I/usr/local/curl-deps/include" LDFLAGS="-L/usr/local/curl-deps/lib" \
     ./configure --prefix=/usr/local/curl-deps --disable-slapd --disable-bdb --disable-hdb \
@@ -121,11 +219,20 @@ RUN wget -q "https://www.openldap.org/software/download/OpenLDAP/openldap-releas
 
 # MIT Kerberos krb5-1.22.2 (for curl GSS-API)
 FROM alpine:3.22.3 AS krb5-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev bison perl ncurses-dev
 COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
 # krb5: build util+include+lib only (skip kadmin/kdc to avoid master_keyblock duplicate def)
-RUN wget -q "https://kerberos.org/dist/krb5/1.22/krb5-1.22.2.tar.gz" -O /tmp/krb5.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://kerberos.org/dist/krb5/1.22/krb5-1.22.2.tar.gz" -O /tmp/krb5.tar.gz && \
     tar xzf /tmp/krb5.tar.gz -C /tmp && cd /tmp/krb5-1.22.2/src && \
     CPPFLAGS="-I/usr/local/curl-deps/include" LDFLAGS="-L/usr/local/curl-deps/lib" \
     ./configure --prefix=/usr/local/curl-deps --with-crypto-impl=openssl \
@@ -180,9 +287,18 @@ RUN cp -a /tmp/z/lib/* /usr/local/curl-deps/lib/ 2>/dev/null || true && \
 
 # Build nghttp3 1.15.0 (HTTP/3 library, static only)
 FROM alpine:3.22.3 AS nghttp3-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev autoconf automake libtool
-RUN wget -q "https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.gz" -O /tmp/nghttp3.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3-1.15.0.tar.gz" -O /tmp/nghttp3.tar.gz && \
     tar xzf /tmp/nghttp3.tar.gz -C /tmp && \
     cd /tmp/nghttp3-1.15.0 && \
     ./configure --enable-lib-only --disable-shared --prefix=/usr/local/http3 && \
@@ -190,11 +306,20 @@ RUN wget -q "https://github.com/ngtcp2/nghttp3/releases/download/v1.15.0/nghttp3
 
 # Build ngtcp2 1.20.0 (QUIC, static, needs OpenSSL 3.5+)
 FROM alpine:3.22.3 AS ngtcp2-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev autoconf automake libtool pkgconfig
 COPY --from=openssl-builder /usr/local/curl-deps /usr/local/curl-deps
 COPY --from=nghttp3-builder /usr/local/http3 /usr/local/http3
-RUN wget -q "https://github.com/ngtcp2/ngtcp2/releases/download/v1.20.0/ngtcp2-1.20.0.tar.gz" -O /tmp/ngtcp2.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/ngtcp2/ngtcp2/releases/download/v1.20.0/ngtcp2-1.20.0.tar.gz" -O /tmp/ngtcp2.tar.gz && \
     tar xzf /tmp/ngtcp2.tar.gz -C /tmp && \
     cd /tmp/ngtcp2-1.20.0 && \
     PKG_CONFIG_PATH=/usr/local/curl-deps/lib/pkgconfig:/usr/local/http3/lib/pkgconfig \
@@ -208,11 +333,20 @@ COPY supervisord/libngtcp2_crypto_ossl.pc /usr/local/http3/lib/pkgconfig/libngtc
 # Build static curl: custom deps (OpenSSL 3.6.1 zlib 1.3.1 brotli 1.2.0 zstd 1.5.7
 # libssh2 1.11.1 nghttp2 1.68.0 libidn2 OpenLDAP 2.6.13 krb5-1.22.2) + ngtcp2/nghttp3 for HTTP/3.
 FROM alpine:3.22.3 AS curl-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make clang musl-dev pkgconfig ca-certificates libunistring-static gettext-static
 COPY --from=curl-deps-all /usr/local/curl-deps /usr/local/curl-deps
 COPY --from=ngtcp2-builder /usr/local/http3 /usr/local/http3
-RUN wget -q "https://curl.se/download/curl-8.19.0.tar.gz" -O /tmp/curl.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://curl.se/download/curl-8.19.0.tar.gz" -O /tmp/curl.tar.gz && \
     tar xzf /tmp/curl.tar.gz -C /tmp && \
     cd /tmp/curl-8.19.0 && \
     PKG_CONFIG_PATH=/usr/local/curl-deps/lib/pkgconfig:/usr/local/http3/lib/pkgconfig \
@@ -236,9 +370,18 @@ RUN wget -q "https://curl.se/download/curl-8.19.0.tar.gz" -O /tmp/curl.tar.gz &&
 
 # Build static busybox - sh/su/id with better Ctrl+C; install to /usr/local/busybox (→ /shared/busybox)
 FROM alpine:3.22.3 AS busybox-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev linux-headers perl
-RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busybox.tar.bz2 && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busybox.tar.bz2 && \
     tar xjf /tmp/busybox.tar.bz2 -C /tmp && \
     cd /tmp/busybox-1.37.0 && \
     make defconfig && \
@@ -258,9 +401,18 @@ RUN wget -q "https://busybox.net/downloads/busybox-1.37.0.tar.bz2" -O /tmp/busyb
 
 # Static ldns drill + dig symlink: BusyBox has nslookup (CONFIG_NSLOOKUP) but no dig applet; drill is dig-like (ldns).
 FROM alpine:3.22.3 AS ldns-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev linux-headers perl openssl-dev openssl-libs-static zlib-static
-RUN wget -q "https://nlnetlabs.nl/downloads/ldns/ldns-1.8.4.tar.gz" -O /tmp/ldns.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://nlnetlabs.nl/downloads/ldns/ldns-1.8.4.tar.gz" -O /tmp/ldns.tar.gz && \
     tar xzf /tmp/ldns.tar.gz -C /tmp && cd /tmp/ldns-1.8.4 && \
     PKG_CONFIG_PATH=/usr/lib/pkgconfig \
     LDFLAGS="-static" \
@@ -274,9 +426,18 @@ RUN wget -q "https://nlnetlabs.nl/downloads/ldns/ldns-1.8.4.tar.gz" -O /tmp/ldns
 
 # Build static strace and place into busybox bin.
 FROM alpine:3.22.3 AS strace-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev linux-headers
-RUN wget -q "https://github.com/strace/strace/releases/download/v6.10/strace-6.10.tar.xz" -O /tmp/strace.tar.xz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://github.com/strace/strace/releases/download/v6.10/strace-6.10.tar.xz" -O /tmp/strace.tar.xz && \
     tar xJf /tmp/strace.tar.xz -C /tmp && \
     cd /tmp/strace-6.10 && \
     ./configure --disable-shared --enable-static --enable-mpers=no --enable-bundled=yes --prefix=/usr/local/strace && \
@@ -285,15 +446,24 @@ RUN wget -q "https://github.com/strace/strace/releases/download/v6.10/strace-6.1
 
 # Build static tcpdump (with static libpcap) and place into busybox bin.
 FROM alpine:3.22.3 AS tcpdump-builder
-RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.ustc.edu.cn/g' /etc/apk/repositories && \
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
+    http_proxy=$http_proxy https_proxy=$https_proxy no_proxy=$no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache wget make gcc musl-dev linux-headers flex bison
-RUN wget -q "https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz" -O /tmp/libpcap.tar.gz && \
+RUN wget -q --tries=5 --timeout=120 --read-timeout=120 "https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz" -O /tmp/libpcap.tar.gz && \
     tar xzf /tmp/libpcap.tar.gz -C /tmp && \
     cd /tmp/libpcap-1.10.5 && \
     ./configure --disable-shared --enable-static --prefix=/usr/local/tcpdump-deps && \
     make -j$(nproc) && \
     make install && \
-    wget -q "https://www.tcpdump.org/release/tcpdump-4.99.5.tar.gz" -O /tmp/tcpdump.tar.gz && \
+    wget -q --tries=5 --timeout=120 --read-timeout=120 "https://www.tcpdump.org/release/tcpdump-4.99.5.tar.gz" -O /tmp/tcpdump.tar.gz && \
     tar xzf /tmp/tcpdump.tar.gz -C /tmp && \
     cd /tmp/tcpdump-4.99.5 && \
     CPPFLAGS="-I/usr/local/tcpdump-deps/include" LDFLAGS="-L/usr/local/tcpdump-deps/lib -static" \
@@ -302,7 +472,18 @@ RUN wget -q "https://www.tcpdump.org/release/libpcap-1.10.5.tar.gz" -O /tmp/libp
     make install
 
 FROM alpine:3.22.3
-RUN apk add --no-cache ca-certificates
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ARG http_proxy
+ARG https_proxy
+ARG no_proxy
+ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
+# 不在最终镜像中保留 ENV 代理变量，仅构建 apk 时使用
+RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
+    HTTP_PROXY="${HTTP_PROXY}" HTTPS_PROXY="${HTTPS_PROXY}" NO_PROXY="${NO_PROXY}" \
+    http_proxy="${http_proxy}" https_proxy="${https_proxy}" no_proxy="${no_proxy}" \
+    apk add --no-cache ca-certificates
 COPY --from=builder /usr/local/bin/supervisord /usr/local/bin/supervisord
 COPY --from=builder /usr/local/bin/exec-in-ns /usr/local/bin/exec-in-ns
 COPY --from=builder /usr/local/bin/cpu-simulator /usr/local/bin/cpu-simulator
