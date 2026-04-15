@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,7 +21,11 @@ import (
 var procfsSimulatorPaths = []string{"/shared/supervisord/procfs-simulator", "/usr/local/bin/procfs-simulator"}
 
 const runContainerMagic = "__run_container__"
-const runHelperMagic   = "__run_helper__"
+const runHelperMagic = "__run_helper__"
+
+// CNI bootstrap: Android netd may flush eth0 IPv4/routes after boot; we snapshot what the CNI
+// programmed (Cilium: /32 + default via x.x.x.2) and restore periodically. Calico uses 169.254.1.1.
+const cniBootstrapDir = "/shared/cni-bootstrap"
 
 // handleRunHelper runs when the process was invoked as:
 //
@@ -66,8 +71,11 @@ func handleRunContainer() bool {
 	// When using pod network (default), lo is already up.
 	setupLoopback()
 
-	// 确保 Calico 默认路由存在。Calico CNI 在容器启动时添加，但 Android init/netd 可能清除策略路由导致 default 丢失。
-	restoreCalicoDefaultRoute()
+	// Snapshot pod IPv4 + gateway before /init/netd can flush Cilium-assigned addresses, then best-effort restore.
+	saveCNIBootstrapSnapshot()
+	restorePodNetwork()
+	// AOSP Ethernet: STATIC + optional IPv6 InitialConfiguration (see patches/rk_aosp10).
+	cloudphoneNetworkBootstrapBeforeInit()
 
 	// Setup cpuset so redroid init can write to /dev/cpuset/foreground/tasks.
 	setupCpusetForRedroid()
@@ -111,10 +119,19 @@ func handleRunContainer() bool {
 func runHelperDelayedTasks() {
 	mountCpusetAfterInitDevReady()
 	time.Sleep(3 * time.Second)
-	restoreCalicoDefaultRoute()
+	restorePodNetwork()
+	// netd may flush eth0 long after boot; keep restoring in the background for the lifetime of this helper.
+	go func() {
+		tick := time.NewTicker(30 * time.Second)
+		defer tick.Stop()
+		for range tick.C {
+			restorePodNetwork()
+		}
+	}()
 	writeSystemResolvConfAfterBootCompleted()
 	runProcfsSimulatorAfterInit()
 	ensureTombstonesWritable()
+	select {} // keep helper alive so periodic CNI restore keeps running
 }
 
 // mountCpusetAfterInitDevReady 在 init 创建 /dev 后 bind mount cpuset，供 init.rc copy 命令使用。
@@ -321,8 +338,8 @@ func unmountForInitRestart() {
 	_ = unix.Unmount("/dev/__properties__", unix.MNT_DETACH)
 	_ = os.RemoveAll("/dev/__properties__")
 
-	// 3. Restore Calico default route. When init/netd dies, it may flush policy routing; Calico uses 169.254.1.1.
-	restoreCalicoDefaultRoute()
+	// 3. Restore pod IPv4/routes if netd flushed them (same as Cilium path).
+	restorePodNetwork()
 }
 
 // writeSystemResolvConf copies /shared/etc/resolv.conf into /system/etc/resolv.conf.
@@ -385,21 +402,217 @@ func mountSysfsWithSimulatedCpu() {
 	}
 }
 
-func restoreCalicoDefaultRoute() {
-	path := "ip"
+func resolveIPBinary() string {
 	for _, p := range []string{"/shared/toybox-bin/ip", "/shared/busybox/bin/ip", "/sbin/ip", "/usr/sbin/ip"} {
 		if _, err := os.Stat(p); err == nil {
-			path = p
+			return p
+		}
+	}
+	return "ip"
+}
+
+func ipCmdEnv() []string {
+	return append(os.Environ(), "PATH=/shared/bin:/shared/toybox-bin:/shared/busybox/bin:/sbin:/usr/sbin:/bin:/usr/bin")
+}
+
+// saveCNIBootstrapSnapshot writes /shared/cni-bootstrap/{ipv4,gateway}.txt from the current pod netns.
+// Retries briefly: Cilium may program eth0 slightly after the main container process starts.
+func saveCNIBootstrapSnapshot() {
+	for attempt := 0; attempt < 20; attempt++ {
+		if saveCNIBootstrapSnapshotOnce() {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func saveCNIBootstrapSnapshotOnce() bool {
+	ipbin := resolveIPBinary()
+	out, err := exec.Command(ipbin, "-4", "-o", "addr", "show", "dev", "eth0").CombinedOutput()
+	if err != nil {
+		return false
+	}
+	line := strings.TrimSpace(string(out))
+	fields := strings.Fields(line)
+	var ipv4 string
+	for i, f := range fields {
+		if f == "inet" && i+1 < len(fields) {
+			ipv4 = strings.Split(fields[i+1], "/")[0]
 			break
 		}
 	}
-	env := append(os.Environ(), "PATH=/shared/bin:/shared/toybox-bin:/shared/busybox/bin:/sbin:/usr/sbin:/bin:/usr/bin")
+	if ipv4 == "" || net.ParseIP(ipv4) == nil {
+		return false
+	}
+	rtOut, err := exec.Command(ipbin, "-4", "route", "show", "default", "dev", "eth0").CombinedOutput()
+	gw := ""
+	if err == nil {
+		fs := strings.Fields(strings.TrimSpace(string(rtOut)))
+		for i, f := range fs {
+			if f == "via" && i+1 < len(fs) {
+				gw = fs[i+1]
+				break
+			}
+		}
+	}
+	if gw == "" {
+		rtOut2, err2 := exec.Command(ipbin, "-4", "route", "show", "default").CombinedOutput()
+		if err2 == nil {
+			fs := strings.Fields(strings.TrimSpace(string(rtOut2)))
+			for i, f := range fs {
+				if f == "via" && i+1 < len(fs) {
+					gw = fs[i+1]
+					break
+				}
+			}
+		}
+	}
+	_ = os.MkdirAll(cniBootstrapDir, 0755)
+	_ = os.WriteFile(filepath.Join(cniBootstrapDir, "ipv4.txt"), []byte(ipv4), 0644)
+	if gw != "" && net.ParseIP(gw) != nil {
+		_ = os.WriteFile(filepath.Join(cniBootstrapDir, "gateway.txt"), []byte(gw), 0644)
+	}
+	if ipv6, gw6 := detectIPv6Bootstrap(ipbin); ipv6 != "" {
+		_ = os.WriteFile(filepath.Join(cniBootstrapDir, "ipv6.txt"), []byte(ipv6), 0644)
+		if gw6 != "" {
+			_ = os.WriteFile(filepath.Join(cniBootstrapDir, "gateway6.txt"), []byte(gw6), 0644)
+		}
+	}
+	return true
+}
+
+func detectIPv6Bootstrap(ipbin string) (ipv6 string, gateway6 string) {
+	out, err := exec.Command(ipbin, "-6", "-o", "addr", "show", "dev", "eth0", "scope", "global").CombinedOutput()
+	if err == nil {
+		line := strings.TrimSpace(string(out))
+		fields := strings.Fields(line)
+		for i, f := range fields {
+			if f == "inet6" && i+1 < len(fields) {
+				ipv6 = strings.Split(fields[i+1], "/")[0]
+				break
+			}
+		}
+	}
+	if ip := net.ParseIP(ipv6); ip == nil || ip.To4() != nil {
+		ipv6 = ""
+	}
+	rtOut, err := exec.Command(ipbin, "-6", "route", "show", "default", "dev", "eth0").CombinedOutput()
+	if err == nil {
+		fs := strings.Fields(strings.TrimSpace(string(rtOut)))
+		for i, f := range fs {
+			if f == "via" && i+1 < len(fs) {
+				gateway6 = fs[i+1]
+				break
+			}
+		}
+	}
+	if ip := net.ParseIP(gateway6); ip == nil || ip.To4() != nil {
+		gateway6 = ""
+	}
+	return ipv6, gateway6
+}
+
+func guessCiliumGatewayFromPodIP(ipv4 string) string {
+	ip := net.ParseIP(ipv4)
+	if ip == nil {
+		return ""
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return ""
+	}
+	// Typical Cilium per-node next-hop: a.b.c.2 in the pod's /24-equivalent routing domain.
+	return fmt.Sprintf("%d.%d.%d.2", v4[0], v4[1], v4[2])
+}
+
+// restorePodNetwork restores eth0 IPv4 + default route from bootstrap files, POD_IP env, or Calico legacy next-hop.
+func restorePodNetwork() {
+	ipbin := resolveIPBinary()
+	env := ipCmdEnv()
+
+	ipv4 := strings.TrimSpace(readFileTrim(filepath.Join(cniBootstrapDir, "ipv4.txt")))
+	gw := strings.TrimSpace(readFileTrim(filepath.Join(cniBootstrapDir, "gateway.txt")))
+	if ipv4 == "" {
+		ipv4 = strings.TrimSpace(os.Getenv("POD_IP"))
+	}
+	if gw == "" && ipv4 != "" {
+		gw = guessCiliumGatewayFromPodIP(ipv4)
+	}
+
+	if ipv4 != "" && net.ParseIP(ipv4) != nil {
+		cmd := exec.Command(ipbin, "addr", "replace", ipv4+"/32", "dev", "eth0")
+		cmd.Env = env
+		_ = cmd.Run()
+	}
+	if gw != "" && net.ParseIP(gw) != nil {
+		cmd := exec.Command(ipbin, "route", "replace", "default", "via", gw, "dev", "eth0")
+		cmd.Env = env
+		_ = cmd.Run()
+		cmd2 := exec.Command(ipbin, "route", "replace", gw+"/32", "dev", "eth0", "scope", "link")
+		cmd2.Env = env
+		_ = cmd2.Run()
+	} else if ipv4 == "" {
+		// Legacy Calico (no snapshot / no POD_IP): next-hop 169.254.1.1
+		restoreCalicoDefaultRoute()
+	}
+
+	// Restore IPv6 default route when available (Cilium dual-stack /128 pod IP case).
+	// Android netd may remove it after init; keep it in both policy table and main.
+	ipv6 := strings.TrimSpace(readFileTrim(filepath.Join(cniBootstrapDir, "ipv6.txt")))
+	gw6 := strings.TrimSpace(readFileTrim(filepath.Join(cniBootstrapDir, "gateway6.txt")))
+	if gw6 == "" {
+		// Best-effort fallback for Cilium-style addressing: fd00::xxxx -> gateway fd00::xx0e.
+		gw6 = guessCiliumGateway6FromPodIP(ipv6)
+	}
+	if ip := net.ParseIP(gw6); ip != nil && ip.To4() == nil {
+		cmd := exec.Command(ipbin, "-6", "route", "replace", gw6+"/128", "dev", "eth0", "table", "eth0")
+		cmd.Env = env
+		_ = cmd.Run()
+		cmd = exec.Command(ipbin, "-6", "route", "replace", "default", "via", gw6, "dev", "eth0", "table", "eth0")
+		cmd.Env = env
+		_ = cmd.Run()
+		cmd = exec.Command(ipbin, "-6", "route", "replace", gw6+"/128", "dev", "eth0", "table", "main")
+		cmd.Env = env
+		_ = cmd.Run()
+		cmd = exec.Command(ipbin, "-6", "route", "replace", "default", "via", gw6, "dev", "eth0", "table", "main")
+		cmd.Env = env
+		_ = cmd.Run()
+	}
+}
+
+func guessCiliumGateway6FromPodIP(ipv6 string) string {
+	ip := net.ParseIP(strings.TrimSpace(ipv6))
+	if ip == nil || ip.To4() != nil {
+		return ""
+	}
+	// Cilium node gateway convention in this cluster: fd00::<hi><lo> -> fd00::<hi>0e.
+	// Example: pod fd00::3c48 -> node gateway fd00::3c0e.
+	v6 := ip.To16()
+	if v6 == nil {
+		return ""
+	}
+	hi := v6[14]
+	return fmt.Sprintf("fd00::%02x0e", hi)
+}
+
+func readFileTrim(p string) string {
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// restoreCalicoDefaultRoute adds Calico's 169.254.1.1 default path; no-op on Cilium if routes already exist.
+func restoreCalicoDefaultRoute() {
+	path := resolveIPBinary()
+	env := ipCmdEnv()
 	cmd := exec.Command(path, "route", "add", "169.254.1.1", "dev", "eth0", "scope", "link")
 	cmd.Env = env
-	_ = cmd.Run() // ignore error (route may exist)
+	_ = cmd.Run()
 	cmd = exec.Command(path, "route", "add", "default", "via", "169.254.1.1", "dev", "eth0")
 	cmd.Env = env
-	_ = cmd.Run() // ignore error (route may exist)
+	_ = cmd.Run()
 }
 
 // mountProcfs 用 FUSE procfs-simulator 替换 /proc
