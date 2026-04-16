@@ -16,8 +16,6 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
-
-	"github.com/ochinchina/supervisord/process"
 )
 
 var procfsSimulatorPaths = []string{"/shared/supervisord/procfs-simulator", "/usr/local/bin/procfs-simulator"}
@@ -78,6 +76,9 @@ func handleRunContainer() bool {
 	restorePodNetwork()
 	// AOSP Ethernet: STATIC + optional IPv6 InitialConfiguration (see patches/rk_aosp10).
 	cloudphoneNetworkBootstrapBeforeInit()
+
+	// Hide node-agent socket (and optional paths) from Android; cannot mask all of /shared/supervisord (binary lives there).
+	maskPathsForRunContainerAndroid()
 
 	// Setup cpuset so redroid init can write to /dev/cpuset/foreground/tasks.
 	setupCpusetForRedroid()
@@ -296,8 +297,7 @@ func setupLoopback() {
 var androidCpusetDirs = []string{"foreground", "system-background", "background", "top-app", "restricted", "camera-daemon"}
 
 func setupCpusetForRedroid() {
-	// Same as joinForegroundCpusetBeforeFork: wait for koordlet before touching cpuset subtree.
-	process.WaitForKoordletBeforeAndroidCpusetSetup()
+	// Koordlet m+n wait runs in Supervisor.Reload(true) before any program (including container_run) starts.
 	cpusetRoot := findCpusetRoot()
 	if cpusetRoot == "" {
 		return

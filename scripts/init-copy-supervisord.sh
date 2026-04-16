@@ -1,13 +1,13 @@
 #!/bin/sh
-# Init container script: copy supervisord binary and config to /shared/supervisord/.
-# The main container runs /shared/supervisord/supervisord.
+# Init container script: copy supervisord binary and config to /shared/supervisord/ (etc/supervisord.conf).
+# The main container runs /shared/supervisord/supervisord -c /shared/supervisord/etc/supervisord.conf.
 set -e
 
 SHARED="${SHARED_DIR:-/shared}"
 mkdir -p "$SHARED"
 
-# Copy supervisord binary and config to /shared/supervisord/
-mkdir -p "$SHARED/supervisord" "$SHARED/bin"
+# Copy supervisord binary and config to /shared/supervisord/ (config under etc/ so container_run can tmpfs-mask it)
+mkdir -p "$SHARED/supervisord/etc" "$SHARED/bin"
 cp -f /usr/local/bin/supervisord "$SHARED/supervisord/supervisord"
 cp -f /usr/local/bin/exec-in-ns "$SHARED/supervisord/exec-in-ns"
 cp -f /usr/local/bin/cpu-simulator "$SHARED/supervisord/cpu-simulator"
@@ -116,6 +116,6 @@ CPU_SIMULATION_ENABLED="${CPU_SIMULATION_ENABLED:-true}"
   echo 'stderr_logfile_maxbytes=0'
   echo "container_run=$CONTAINER_RUN"
   echo "container_network_isolated=$CONTAINER_NETWORK_ISOLATED"
-} > "$SHARED/supervisord/supervisord.conf"
+} > "$SHARED/supervisord/etc/supervisord.conf"
 
-echo "supervisord and config copied to $SHARED/supervisord"
+echo "supervisord and config copied to $SHARED/supervisord (etc/supervisord.conf)"

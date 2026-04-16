@@ -23,6 +23,9 @@ import (
 // WaitForKoordletBeforeAndroidCpusetSetup blocks until koordlet has applied the m+n cpuset
 // to this cgroup (strict: matches koordlet checkpoint merged dedicated∪shared), or until timeout.
 //
+// Call site: Supervisor.Reload(true) runs this before setSupervisordInfo, event listeners, and
+// autostart — no [program] runs until this returns (when waiting is enabled).
+//
 // Enable when any of:
 //   - KOORDINATOR_QOS_CLASS is LSR or LSE, or
 //   - SUPERVISORD_WAIT_KOORDLET_CPUSET is 1/true
@@ -38,10 +41,13 @@ import (
 // Non-strict (SUPERVISORD_KOORDLET_CPUSET_STRICT=0): fall back to "fewer CPUs than online" heuristic.
 //
 // KOORDLET_CPUSET_WAIT_TIMEOUT_SEC — default 120.
+// SUPERVISORD_CPUSET_WAIT_VERBOSE — set to "0" to reduce logs; default verbose when wait runs.
 func WaitForKoordletBeforeAndroidCpusetSetup() {
 	if !shouldWaitKoordletCpuset() {
+		log.Infof("koordlet cpuset wait: disabled (%s)", explainKoordletWaitDisabled())
 		return
 	}
+	verbose := cpusetWaitVerbose()
 	timeout := 120 * time.Second
 	if s := strings.TrimSpace(os.Getenv("KOORDLET_CPUSET_WAIT_TIMEOUT_SEC")); s != "" {
 		if sec, err := strconv.Atoi(s); err == nil && sec > 0 {
@@ -50,8 +56,10 @@ func WaitForKoordletBeforeAndroidCpusetSetup() {
 	}
 	strict := koordletCpusetStrict()
 	cpusetFile := containerCpusetCpusPath()
+	logKoordletWaitEnv(verbose)
 	if cpusetFile == "" {
-		log.Warn("koordlet cpuset wait: cannot resolve cpuset cgroup path, skip wait")
+		log.Warn("koordlet cpuset wait: cannot resolve cpuset cgroup path from /proc/self/cgroup, skip wait")
+		logProcSelfCgroup(verbose)
 		return
 	}
 	online, err := readSysCPUOnlineList()
@@ -61,14 +69,24 @@ func WaitForKoordletBeforeAndroidCpusetSetup() {
 	}
 	deadline := time.Now().Add(timeout)
 	poll := 200 * time.Millisecond
-	log.Infof("koordlet cpuset wait: strict=%v timeout=%v file=%s", strict, timeout, cpusetFile)
+	log.Infof("koordlet cpuset wait: pid=%d strict=%v timeout=%s poll=%s file=%s online_cpus=%d",
+		os.Getpid(), strict, timeout, poll, cpusetFile, len(online))
+	if verbose {
+		logProcSelfCgroup(verbose)
+	}
 
 	var last string
 	stable := 0
+	iter := 0
 	for time.Now().Before(deadline) {
-		expected, expOK, expErr := resolveExpectedMPlusN(strict)
+		iter++
+		expected, expOK, expErr, src := resolveExpectedMPlusN(strict)
 		if expErr != nil {
-			log.WithError(expErr).Debug("koordlet cpuset wait: resolve expected")
+			if verbose || iter == 1 {
+				log.WithError(expErr).Warn("koordlet cpuset wait: resolve expected m+n")
+			} else {
+				log.WithError(expErr).Debug("koordlet cpuset wait: resolve expected m+n")
+			}
 		}
 		cur, err := readTrimFile(cpusetFile)
 		if err != nil {
@@ -77,17 +95,22 @@ func WaitForKoordletBeforeAndroidCpusetSetup() {
 			continue
 		}
 		var ok bool
+		var cmpErr error
 		if strict && expOK {
-			ok, err = cpusetCanonicalEqual(cur, expected)
-			if err != nil {
-				log.WithError(err).Debug("koordlet cpuset wait: compare")
+			ok, cmpErr = cpusetCanonicalEqual(cur, expected)
+			if cmpErr != nil {
+				log.WithError(cmpErr).Debug("koordlet cpuset wait: canonical compare")
 				ok = false
 			}
 		} else if strict && !expOK {
-			// Wait for checkpoint / explicit env to appear
 			ok = false
 		} else {
 			ok = cpusetWaitSatisfiedLoose(cur, online)
+		}
+		if verbose && (iter == 1 || iter%25 == 0) {
+			looseOK := cpusetWaitSatisfiedLoose(cur, online)
+			log.Infof("koordlet cpuset wait: iter=%d source=%q expOK=%v strict=%v cur=%q expected=%q match=%v stable=%d/2 loose_satisfied=%v",
+				iter, src, expOK, strict, cur, expected, ok, stable, looseOK)
 		}
 		if ok {
 			if cur == last {
@@ -98,9 +121,9 @@ func WaitForKoordletBeforeAndroidCpusetSetup() {
 			}
 			if stable >= 2 {
 				if strict && expOK {
-					log.Infof("koordlet cpuset wait: m+n match stable cpuset.cpus=%q (expected %q)", cur, expected)
+					log.Infof("koordlet cpuset wait: OK stable×2 cpuset.cpus=%q expected=%q source=%q", cur, expected, src)
 				} else {
-					log.Infof("koordlet cpuset wait: satisfied stable cpuset.cpus=%q", cur)
+					log.Infof("koordlet cpuset wait: OK stable×2 cpuset.cpus=%q (non-strict or loose)", cur)
 				}
 				return
 			}
@@ -109,7 +132,59 @@ func WaitForKoordletBeforeAndroidCpusetSetup() {
 		}
 		time.Sleep(poll)
 	}
-	log.Warnf("koordlet cpuset wait: timeout after %v, last=%q — proceeding anyway", timeout, last)
+	log.Warnf("koordlet cpuset wait: TIMEOUT after %v last_read=%q strict=%v — proceeding (Android cpuset may cause koordlet EBUSY on parent cgroup)", timeout, last, strict)
+}
+
+func cpusetWaitVerbose() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SUPERVISORD_CPUSET_WAIT_VERBOSE")))
+	if v == "0" || v == "false" || v == "no" {
+		return false
+	}
+	return true
+}
+
+func explainKoordletWaitDisabled() string {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SUPERVISORD_WAIT_KOORDLET_CPUSET")))
+	if v == "0" || v == "false" || v == "no" {
+		return "SUPERVISORD_WAIT_KOORDLET_CPUSET=0/false/no"
+	}
+	qos := strings.ToUpper(strings.TrimSpace(os.Getenv("KOORDINATOR_QOS_CLASS")))
+	return fmt.Sprintf("KOORDINATOR_QOS_CLASS=%q is not LSR/LSE; set SUPERVISORD_WAIT_KOORDLET_CPUSET=1 to force", qos)
+}
+
+func logKoordletWaitEnv(verbose bool) {
+	if !verbose {
+		return
+	}
+	var b strings.Builder
+	for _, k := range []string{
+		"KOORDINATOR_QOS_CLASS", "SUPERVISORD_KOORDLET_CPUSET_STRICT", "SUPERVISORD_WAIT_KOORDLET_CPUSET",
+		"KOORDINATOR_EXPECT_CPUSET", "KOORDLET_CPUSET_CHECKPOINT_DIR", "KOORDLET_CPUSET_WAIT_TIMEOUT_SEC",
+		"POD_UID", "CLOUDPHONE_NODE_AGENT_SOCKET", "NODE_NAME",
+	} {
+		v := os.Getenv(k)
+		if k == "NODE_AGENT_AUTH_TOKEN" && v != "" {
+			v = "***"
+		}
+		fmt.Fprintf(&b, " %s=%q", k, v)
+	}
+	log.Infof("koordlet cpuset wait: env%s", b.String())
+}
+
+func logProcSelfCgroup(verbose bool) {
+	if !verbose {
+		return
+	}
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		log.WithError(err).Warn("koordlet cpuset wait: read /proc/self/cgroup")
+		return
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if strings.Contains(line, "cpuset") || strings.HasPrefix(strings.TrimSpace(line), "0::") {
+			log.Infof("koordlet cpuset wait: /proc/self/cgroup line: %s", line)
+		}
+	}
 }
 
 func koordletCpusetStrict() bool {
@@ -237,22 +312,22 @@ var (
 	nodeAgentGRPC   *grpc.ClientConn
 )
 
-func resolveExpectedMPlusN(strict bool) (expected string, ok bool, err error) {
+func resolveExpectedMPlusN(strict bool) (expected string, ok bool, err error, source string) {
 	if ex := strings.TrimSpace(os.Getenv("KOORDINATOR_EXPECT_CPUSET")); ex != "" {
 		can, err := cpusetCanonicalString(ex)
 		if err != nil {
-			return "", false, err
+			return "", false, err, "KOORDINATOR_EXPECT_CPUSET"
 		}
-		return can, true, nil
+		return can, true, nil, "KOORDINATOR_EXPECT_CPUSET"
 	}
 	sock := strings.TrimSpace(os.Getenv("CLOUDPHONE_NODE_AGENT_SOCKET"))
 	if sock != "" {
 		s, err := fetchExpectedCpusetFromNodeAgent(sock)
 		if err != nil {
-			return "", false, err
+			return "", false, err, "CLOUDPHONE_NODE_AGENT_SOCKET"
 		}
 		if s != "" {
-			return s, true, nil
+			return s, true, nil, "CLOUDPHONE_NODE_AGENT_SOCKET(GetKoordletMPlusNCpuset)"
 		}
 	}
 	dir := strings.TrimSpace(os.Getenv("KOORDLET_CPUSET_CHECKPOINT_DIR"))
@@ -262,27 +337,27 @@ func resolveExpectedMPlusN(strict bool) (expected string, ok bool, err error) {
 	uid := strings.TrimSpace(os.Getenv("POD_UID"))
 	if uid == "" {
 		if strict {
-			return "", false, fmt.Errorf("POD_UID unset and node-agent did not return m+n (set KOORDINATOR_EXPECT_CPUSET or CLOUDPHONE_NODE_AGENT_SOCKET)")
+			return "", false, fmt.Errorf("POD_UID unset and node-agent did not return m+n (set KOORDINATOR_EXPECT_CPUSET or CLOUDPHONE_NODE_AGENT_SOCKET)"), "none"
 		}
-		return "", false, nil
+		return "", false, nil, "none"
 	}
 	merged, rerr := readMergedMPlusNCheckpoint(dir)
 	if rerr != nil {
-		return "", false, rerr
+		return "", false, rerr, "KOORDLET_CPUSET_CHECKPOINT_DIR"
 	}
 	e, found := merged[uid]
 	if !found {
-		return "", false, nil
+		return "", false, nil, "KOORDLET_CPUSET_CHECKPOINT_DIR"
 	}
 	mergedStr := mergeDedicatedShared(e.Dedicated, e.Shared)
 	if mergedStr == "" {
-		return "", false, fmt.Errorf("empty m+n for pod %s", uid)
+		return "", false, fmt.Errorf("empty m+n for pod %s", uid), "KOORDLET_CPUSET_CHECKPOINT_DIR"
 	}
 	can, err := cpusetCanonicalString(mergedStr)
 	if err != nil {
-		return "", false, err
+		return "", false, err, "KOORDLET_CPUSET_CHECKPOINT_DIR"
 	}
-	return can, true, nil
+	return can, true, nil, "KOORDLET_CPUSET_CHECKPOINT_DIR"
 }
 
 func fetchExpectedCpusetFromNodeAgent(sock string) (string, error) {

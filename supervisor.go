@@ -447,6 +447,11 @@ func (s *Supervisor) Reload(restart bool) (addedGroup []string, changedGroup []s
 
 	}
 	if err == nil {
+		// Before any [program], event listeners, or autostart: wait for koordlet m+n cpuset when enabled.
+		// Reload(false) from RPC skips this to avoid blocking hot reload.
+		if restart {
+			process.WaitForKoordletBeforeAndroidCpusetSetup()
+		}
 		s.setSupervisordInfo()
 		s.startEventListeners()
 		s.createPrograms(prevPrograms)
