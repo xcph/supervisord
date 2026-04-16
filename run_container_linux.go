@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/ochinchina/supervisord/process"
 )
 
 var procfsSimulatorPaths = []string{"/shared/supervisord/procfs-simulator", "/usr/local/bin/procfs-simulator"}
@@ -294,6 +296,8 @@ func setupLoopback() {
 var androidCpusetDirs = []string{"foreground", "system-background", "background", "top-app", "restricted", "camera-daemon"}
 
 func setupCpusetForRedroid() {
+	// Same as joinForegroundCpusetBeforeFork: wait for koordlet before touching cpuset subtree.
+	process.WaitForKoordletBeforeAndroidCpusetSetup()
 	cpusetRoot := findCpusetRoot()
 	if cpusetRoot == "" {
 		return

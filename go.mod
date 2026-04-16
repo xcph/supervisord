@@ -56,6 +56,7 @@ require (
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
+	k8s.io/utils v0.0.0-20241210054802-24370beab758 // indirect
 )
 
 replace github.com/xcph/cloudphone-nodeagent-api => ../cloudphone-nodeagent-api

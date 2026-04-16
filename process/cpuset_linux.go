@@ -18,6 +18,8 @@ var androidCpusetDirs = []string{"foreground", "system-background", "background"
 // (foreground, system-background, background, top-app) so redroid init won't get ENOSPC.
 // Best-effort; errors are ignored.
 func joinForegroundCpusetBeforeFork() {
+	// Let koordlet apply m+n cpuset.cpus before we clone Android cpuset children (avoids EBUSY).
+	WaitForKoordletBeforeAndroidCpusetSetup()
 	cpusetRoot, cgPath := findCpusetPath("/proc/self/cgroup")
 	if cpusetRoot == "" || cgPath == "" {
 		return
