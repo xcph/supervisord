@@ -152,6 +152,7 @@ func (p *Process) Start(wait bool) {
 		return
 	}
 
+	// 必须在 Unlock 之前置位，否则并发两次 Start() 可能都通过 inStart 检查，拉起重复子进程。
 	p.inStart = true
 	p.stopByUser = false
 	p.lock.Unlock()
@@ -402,22 +403,70 @@ func (p *Process) isRunning() bool {
 			proc, err := ps.FindProcess(p.cmd.Process.Pid)
 			return proc != nil && err == nil
 		}
-		return p.cmd.Process.Signal(syscall.Signal(0)) == nil
+		return unixPidAlive(p.cmd.Process.Pid)
 	}
 	return false
 }
 
+// reapOrKillStrayChildBeforeRecreateCmd ensures we do not leave a live child when replacing p.cmd.
+// Without this, the next start retry assigns a new *exec.Cmd while a previous goroutine may still
+// be waiting on the old one only by reading p.cmd — producing multiple concurrent children (same program).
+func (p *Process) reapOrKillStrayChildBeforeRecreateCmd() {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return
+	}
+	if p.cmd.ProcessState != nil {
+		return
+	}
+	pid := p.cmd.Process.Pid
+	var alive bool
+	if runtime.GOOS == "windows" {
+		alive = p.cmd.Process.Signal(syscall.Signal(0)) == nil
+	} else {
+		alive = unixPidAlive(pid)
+	}
+	if !alive {
+		return
+	}
+	log.WithFields(log.Fields{"program": p.GetName(), "pid": pid}).Warn(
+		"terminating stray child before new exec.Cmd (fix duplicate processes when start retry replaces cmd before Wait completes)")
+	old := p.cmd
+	killasgroup := p.config.GetBool("killasgroup", false)
+	if err := signals.Kill(old.Process, syscall.SIGKILL, killasgroup); err != nil {
+		log.WithFields(log.Fields{"program": p.GetName(), "pid": pid, "err": err}).Warn("SIGKILL stray child")
+	}
+	done := make(chan struct{})
+	go func(c *exec.Cmd) {
+		_ = c.Wait()
+		close(done)
+	}(old)
+	select {
+	case <-done:
+	case <-time.After(time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second):
+		log.WithFields(log.Fields{"program": p.GetName(), "pid": pid}).Warn("timeout waiting stray child after SIGKILL")
+	}
+}
+
 // create Command object for the program
 func (p *Process) createProgramCommand() error {
+	p.reapOrKillStrayChildBeforeRecreateCmd()
+
 	args, err := parseCommand(p.config.GetStringExpression("command", ""))
 
 	if err != nil {
 		return err
 	}
 	programPath := args[0]
-	if p.config.GetBool("container_run", false) {
+	cr := p.config.GetBool("container_run", false)
+	if cr {
 		args = createContainerRunWrapper(args)
 	}
+	log.WithFields(log.Fields{
+		"program":       p.GetName(),
+		"container_run": cr,
+		"orig_argv0":    programPath,
+		"argv_len":      len(args),
+	}).Debug("createProgramCommand: parsed command")
 	p.cmd, err = createCommand(args)
 	if err != nil {
 		return err
@@ -430,6 +479,26 @@ func (p *Process) createProgramCommand() error {
 	setDeathsig(p.cmd.SysProcAttr)
 	setContainerRun(p.cmd.SysProcAttr, p.config)
 	p.setEnv()
+	hasTargetUID := false
+	hasTargetGID := false
+	hasAppArmorExec := false
+	for _, e := range p.cmd.Env {
+		if strings.HasPrefix(e, "SUPERVISORD_TARGET_UID=") {
+			hasTargetUID = true
+		}
+		if strings.HasPrefix(e, "SUPERVISORD_TARGET_GID=") {
+			hasTargetGID = true
+		}
+		if strings.HasPrefix(e, "SUPERVISORD_APPARMOR_EXEC_PROFILE=") {
+			hasAppArmorExec = true
+		}
+	}
+	log.WithFields(log.Fields{
+		"program":               p.GetName(),
+		"defer_setuid_env_uid":  hasTargetUID,
+		"defer_setuid_env_gid":  hasTargetGID,
+		"has_apparmor_exec_env": hasAppArmorExec,
+	}).Debug("createProgramCommand: env flags for container_run / deferred credentials")
 	p.setDir()
 	p.setLog()
 
@@ -495,9 +564,15 @@ func (p *Process) setProgramRestartChangeMonitor(programPath string) {
 
 // wait for the started program exit
 func (p *Process) waitForExit(startSecs int64) {
-	p.cmd.Wait()
-	if p.cmd.ProcessState != nil {
-		log.WithFields(log.Fields{"program": p.GetName()}).Infof("program stopped with status:%v", p.cmd.ProcessState)
+	// Capture cmd at entry: createProgramCommand may replace p.cmd on the next start retry while this
+	// goroutine runs; waiting on the wrong *exec.Cmd leaves the old child orphaned (duplicate PIDs).
+	cmd := p.cmd
+	if cmd == nil {
+		return
+	}
+	_ = cmd.Wait()
+	if cmd.ProcessState != nil {
+		log.WithFields(log.Fields{"program": p.GetName()}).Infof("program stopped with status:%v", cmd.ProcessState)
 	} else {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("program stopped")
 	}
@@ -599,10 +674,13 @@ func (p *Process) run(finishCb func()) {
 				p.failToStartProgram(fmt.Sprintf("fail to start program with error:%v", err), finishCbWrapper)
 				break
 			} else {
-				log.WithFields(log.Fields{"program": p.GetName()}).Info("fail to start program with error:", err)
+				log.WithFields(log.Fields{"program": p.GetName(), "retry": atomic.LoadInt32(p.retryTimes)}).Info("fail to start program with error:", err)
 				p.changeStateTo(Backoff)
 				continue
 			}
+		}
+		if p.cmd.Process != nil {
+			log.WithFields(log.Fields{"program": p.GetName(), "pid": p.cmd.Process.Pid, "retry": atomic.LoadInt32(p.retryTimes)}).Debug("program child started")
 		}
 		if p.StdoutLog != nil {
 			p.StdoutLog.SetPid(p.cmd.Process.Pid)
@@ -656,13 +734,16 @@ func (p *Process) run(finishCb func()) {
 			close(procExitC)
 		}()
 
+		loopExit := "unknown"
 	LOOP:
 		for {
 			select {
 			case <-procExitC:
+				loopExit = "child_wait_returned"
 				break LOOP
 			default:
 				if !p.isRunning() {
+					loopExit = "is_running_false"
 					break LOOP
 				}
 			}
@@ -690,6 +771,25 @@ func (p *Process) run(finishCb func()) {
 			}
 			break
 		} else {
+			// Child exited (or never reached Running) before monitorProgramIsRunning promoted Starting→Running.
+			// This is normal supervisord behavior when the process dies within startsecs — not "duplicate programs".
+			exitLog := log.Fields{
+				"program":    p.GetName(),
+				"retry":      atomic.LoadInt32(p.retryTimes),
+				"startsecs":  startSecs,
+				"loop_exit":  loopExit,
+			}
+			if p.cmd != nil && p.cmd.ProcessState != nil {
+				exitLog["process_state"] = p.cmd.ProcessState.String()
+				if code, err := p.getExitCode(); err == nil {
+					exitLog["exit_code"] = code
+				}
+			}
+			msg := "startup failed before startsecs (supervisord will retry until startretries); inspect child stderr / app logs (e.g. bind EADDRINUSE)"
+			if loopExit == "is_running_false" {
+				msg += " — loop_exit=is_running_false means Signal(0) on current p.cmd failed (child may have exited, or p.cmd no longer matches the live PID; check ps for duplicate children)"
+			}
+			log.WithFields(exitLog).Warn(msg)
 			p.changeStateTo(Backoff)
 		}
 
@@ -780,13 +880,17 @@ func (p *Process) setEnv() {
 	envFromFiles := p.config.GetEnvFromFiles("envFiles")
 	env := p.config.GetEnv("environment")
 	if len(env)+len(envFromFiles) != 0 {
-		p.cmd.Env = mergeKeyValueArrays(p.cmd.Env, append(append(os.Environ(), envFromFiles...), env...))
+		// envFiles + [program]environment 必须先于 os.Environ 参与 merge：旧顺序把 os 放在前，
+		// 导致 program 中的 HOME= 等无法覆盖 supervisord（root）继承的环境，user=node 子进程仍带
+		// HOME=/root，常见后果是 OpenClaw 读错配置路径后秒退 → supervisord 报 Fatal。
+		p.cmd.Env = mergeKeyValueArrays(append(envFromFiles, env...), os.Environ())
 	} else {
 		p.cmd.Env = mergeKeyValueArrays(p.cmd.Env, os.Environ())
 	}
 	// Persist resolv.conf in supervisord namespace to shared path.
 	// The container-run helper (init namespace) reads /shared/etc/resolv.conf and writes to /system/etc/resolv.conf.
 	if p.config.GetBool("container_run", false) {
+		maybeInjectContainerRunAppArmorEnv(p)
 		if data, err := os.ReadFile("/etc/resolv.conf"); err == nil {
 			_ = os.MkdirAll("/shared/etc", 0755)
 			_ = os.WriteFile("/shared/etc/resolv.conf", data, 0644)
@@ -999,7 +1103,22 @@ func (p *Process) setUser() error {
 			return err
 		}
 	}
-	setUserID(p.cmd.SysProcAttr, uint32(uid), uint32(gid))
+	if p.config.GetBool("container_run", false) {
+		// container_run 需要 wrapper(__run_container__) 先以 root 完成 mount/proc 等初始化，
+		// 再在最终 exec 前按 program user 降权到目标 uid/gid。
+		p.cmd.Env = appendEnvWithOverride(p.cmd.Env,
+			"SUPERVISORD_TARGET_UID", strconv.FormatUint(uid, 10),
+			"SUPERVISORD_TARGET_GID", strconv.FormatUint(gid, 10),
+		)
+		log.WithFields(log.Fields{
+			"program": p.GetName(),
+			"user":    userName,
+			"uid":     uid,
+			"gid":     gid,
+		}).Info("container_run enabled: defer user switch to __run_container__ final exec")
+	} else {
+		setUserID(p.cmd.SysProcAttr, uint32(uid), uint32(gid))
+	}
 
 	// 强制设置关键环境变量
 	p.cmd.Env = appendEnvWithOverride(p.cmd.Env,

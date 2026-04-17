@@ -282,6 +282,10 @@ The Prometheus node exporter supported supervisord metrics are now integrated in
 For example, if the port parameter in "inet_http_server" is "127.0.0.1:9001" and then the metrics server should be accessed in url "http://127.0.0.1:9001/metrics" 
 
 
+# Linux: `container_run` process model (OpenClaw fork)
+
+When `container_run` is enabled, programs are launched via `__run_container__` (namespaces, optional AppArmor, deferred `setuid`). When disabled, the configured `command` runs as a direct child. Full fork/namespace/AppArmor flow (including `__run_gate_exec__` for non-`/init` targets): **[docs/container-run-process-model.md](docs/container-run-process-model.md)**（中文）.
+
 # Register service
 
 Autostart supervisord after os started. Look up supported platforms at [kardianos/service](https://github.com/kardianos/service).

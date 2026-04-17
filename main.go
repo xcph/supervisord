@@ -185,6 +185,9 @@ func main() {
 	if handleRunHelper() {
 		return
 	}
+	if handleRunGateExec() {
+		return
+	}
 	if handleRunContainer() {
 		return
 	}

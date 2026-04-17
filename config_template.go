@@ -55,6 +55,13 @@ killasgroup=true
 container_run=false
 # When true, also use CLONE_NEWNET. Breaks redroid netd/iptables; only for full isolation.
 container_network_isolated=false
+# Linux AppArmor: apply profile on next exec(2) inside container_run (writes /proc/self/attr/exec
+# with "exec <name>"; same class as aa_change_onexec). If the kernel/task cannot use AppArmor exec
+# transitions (module missing, AA disabled, or /proc/self/attr/exec unusable), these options are
+# ignored automatically. When available but write fails: exit before exec unless
+# container_run_apparmor_relaxed=true (then log and continue).
+container_run_apparmor_profile=
+container_run_apparmor_relaxed=false
 user=user1
 redirect_stderr=false
 stdout_logfile=AUTO

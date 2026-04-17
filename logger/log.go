@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -89,6 +90,13 @@ func (l *FileLogger) openFile(trunc bool) error {
 		l.file.Close()
 	}
 	var err error
+	dir := filepath.Dir(l.name)
+	if dir != "." && dir != "" {
+		if err = os.MkdirAll(dir, 0o755); err != nil {
+			fmt.Printf("Fail to create log directory --%s-- with error %v\n", dir, err)
+			return err
+		}
+	}
 	fileInfo, err := os.Stat(l.name)
 
 	if trunc || err != nil {

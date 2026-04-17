@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,10 +23,128 @@ var procfsSimulatorPaths = []string{"/shared/supervisord/procfs-simulator", "/us
 
 const runContainerMagic = "__run_container__"
 const runHelperMagic = "__run_helper__"
+// runGateExecMagic: forked child (pid != 1) applies AppArmor exec attr then execs the real target.
+// See prepareAppArmorExecTransition(skipWhenPID1) — PID 1 cannot reliably queue the transition
+// before syscall.ForkExec(helper), which would otherwise consume the next-exec profile.
+const runGateExecMagic = "__run_gate_exec__"
+
+func containerRunDebugEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SUPERVISORD_DEBUG_CONTAINER_RUN")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+func containerRunDebugf(format string, args ...interface{}) {
+	if containerRunDebugEnabled() {
+		fmt.Fprintf(os.Stderr, "run_container: [debug] "+format+"\n", args...)
+	}
+}
+
+func dropPrivilegesForFinalExecIfRequested() error {
+	uidRaw := strings.TrimSpace(os.Getenv("SUPERVISORD_TARGET_UID"))
+	gidRaw := strings.TrimSpace(os.Getenv("SUPERVISORD_TARGET_GID"))
+	if uidRaw == "" && gidRaw == "" {
+		return nil
+	}
+	if uidRaw == "" || gidRaw == "" {
+		return fmt.Errorf("incomplete target credentials: SUPERVISORD_TARGET_UID=%q SUPERVISORD_TARGET_GID=%q", uidRaw, gidRaw)
+	}
+	uid64, err := strconv.ParseUint(uidRaw, 10, 32)
+	if err != nil {
+		return fmt.Errorf("parse SUPERVISORD_TARGET_UID=%q: %w", uidRaw, err)
+	}
+	gid64, err := strconv.ParseUint(gidRaw, 10, 32)
+	if err != nil {
+		return fmt.Errorf("parse SUPERVISORD_TARGET_GID=%q: %w", gidRaw, err)
+	}
+	uid := int(uid64)
+	gid := int(gid64)
+	origUID, origGID := os.Getuid(), os.Getgid()
+	// Align with process.setUser setUserID(NoSetGroups=true): avoid inheriting root supplementary groups.
+	if err := unix.Setgroups([]int{}); err != nil && err != unix.EPERM {
+		return fmt.Errorf("clear supplementary groups: %w", err)
+	}
+	if err := unix.Setgid(gid); err != nil {
+		return fmt.Errorf("setgid(%d): %w", gid, err)
+	}
+	if err := unix.Setuid(uid); err != nil {
+		return fmt.Errorf("setuid(%d): %w", uid, err)
+	}
+	fmt.Fprintf(os.Stderr, "run_container: final exec credentials switched to uid=%d gid=%d (wrapper started as uid=%d gid=%d)\n",
+		uid, gid, origUID, origGID)
+	containerRunDebugf("dropped privileges for final exec to uid=%d gid=%d", uid, gid)
+	return nil
+}
 
 // CNI bootstrap: Android netd may flush eth0 IPv4/routes after boot; we snapshot what the CNI
 // programmed (Cilium: /32 + default via x.x.x.2) and restore periodically. Calico uses 169.254.1.1.
 const cniBootstrapDir = "/shared/cni-bootstrap"
+
+func isInitNamespaceTarget(target string) bool {
+	c := filepath.Clean(target)
+	return c == "/init" || c == "/sbin/init"
+}
+
+// runContainerChildReaperLoop runs in PID 1 after delegating the final gateway exec to a child.
+// It reaps the gateway child and keeps the helper subprocess as a sibling until the container stops.
+func runContainerChildReaperLoop() {
+	fmt.Fprintln(os.Stderr, "run_container: pid=1 entering wait loop (gateway child + helper)")
+	for {
+		var ws syscall.WaitStatus
+		pid, err := syscall.Wait4(-1, &ws, 0, nil)
+		if err != nil {
+			if err == syscall.EINTR {
+				continue
+			}
+			if err == syscall.ECHILD {
+				fmt.Fprintln(os.Stderr, "run_container: reaper: no child processes remain")
+				os.Exit(0)
+			}
+			fmt.Fprintf(os.Stderr, "run_container: reaper wait4: %v\n", err)
+			os.Exit(1)
+		}
+		containerRunDebugf("reaper: reaped pid=%d waitstatus=%v", pid, ws)
+	}
+}
+
+// handleRunGateExec runs when invoked as:
+//
+//	supervisord __run_gate_exec__ <target> [args...]
+//
+// It exists so AppArmor "exec profile" can be applied from a task that is not PID 1 in the
+// container_run PID namespace (gorilla/kernel reject or skip attr/exec on pid 1), then exec
+// the real program (e.g. openclaw-gateway-exec.sh).
+func handleRunGateExec() bool {
+	if len(os.Args) < 3 || os.Args[1] != runGateExecMagic {
+		return false
+	}
+	argv := os.Args[2:]
+	if len(argv) < 1 {
+		fmt.Fprintln(os.Stderr, "run_container: gate: missing target")
+		os.Exit(1)
+	}
+	target := argv[0]
+	fmt.Fprintf(os.Stderr, "run_container: gate child starting pid=%d target=%q\n", os.Getpid(), target)
+	if err := prepareAppArmorExecTransition(false); err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: gate apparmor: %v\n", err)
+		os.Exit(1)
+	}
+	if err := dropPrivilegesForFinalExecIfRequested(); err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: gate drop privileges: %v\n", err)
+		os.Exit(1)
+	}
+	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+		containerRunDebugf("gate before exec current label=%q", strings.TrimSpace(string(b)))
+	} else {
+		containerRunDebugf("gate before exec read /proc/self/attr/current failed: %v", err)
+	}
+	execEnv := filterSupervisordInternalEnv(os.Environ())
+	containerRunDebugf("gate exec target=%q argv=%q env_count=%d", target, argv, len(execEnv))
+	if err := unix.Exec(target, argv, execEnv); err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: gate exec %s: %v\n", target, err)
+		os.Exit(1)
+	}
+	return true
+}
 
 // handleRunHelper runs when the process was invoked as:
 //
@@ -52,17 +171,26 @@ func handleRunContainer() bool {
 	}
 	target := os.Args[2]
 	argv := os.Args[2:]
+	fmt.Fprintf(os.Stderr, "run_container: wrapper starting with uid=%d gid=%d target=%q\n", os.Getuid(), os.Getgid(), target)
+	containerRunDebugf("enter target=%q argv=%q uid=%d euid=%d gid=%d egid=%d ppid=%d",
+		target, argv, os.Getuid(), os.Geteuid(), os.Getgid(), os.Getegid(), os.Getppid())
 
 	// Make mount namespace private so our unmounts don't propagate to supervisord (kubectl exec needs /dev/pts).
-	_ = unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, "")
+	if err := unix.Mount("", "/", "", unix.MS_REC|unix.MS_PRIVATE, ""); err != nil {
+		containerRunDebugf("mount / private failed: %v", err)
+	}
 	// Mount fresh /proc for the new PID namespace (we are PID 1 here).
-	_ = unix.Unmount("/proc", unix.MNT_DETACH)
+	if err := unix.Unmount("/proc", unix.MNT_DETACH); err != nil && err != unix.ENOENT {
+		containerRunDebugf("umount /proc failed: %v", err)
+	}
 	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
 		fmt.Fprintf(os.Stderr, "run_container: mount /proc: %v\n", err)
 		os.Exit(1)
 	}
 	// 确保 /proc 可写，init 需写入 /proc/sys/vm/extra_free_kbytes 等
-	_ = unix.Mount("", "/proc", "", unix.MS_REMOUNT, "rw")
+	if err := unix.Mount("", "/proc", "", unix.MS_REMOUNT, "rw"); err != nil {
+		containerRunDebugf("remount /proc rw failed: %v", err)
+	}
 
 	// 不在此处运行 procfs-simulator：Android init 启动后会重新挂载 /proc，会覆盖 FUSE。
 	// 改为 fork 后由父进程在 init 启动后延迟执行 procfs-simulator。
@@ -91,10 +219,67 @@ func handleRunContainer() bool {
 	// cpu-simulator writes to /shared/cpu-sim; redroid will see simulated cpufreq, thermal.
 	mountSysfsWithSimulatedCpu()
 
-	// Fork helper：在 init 启动后执行延迟任务（cpuset、procfs-simulator、tombstones 等）
-	// 然后 exec /init，让 init 继承 run_container 的 PID，成为 PID 1，正确回收僵尸
-	helperArgv := append([]string{os.Args[0], runHelperMagic}, argv...)
-	helperPid, err := syscall.ForkExec(os.Args[0], helperArgv, &syscall.ProcAttr{
+	execPath := "/proc/self/exe"
+	argv0 := os.Args[0]
+
+	if isInitNamespaceTarget(target) {
+		// Android /init：保持「先 fork helper，再在本任务（常为 PID 1）上 exec /init」。
+		helperArgv := append([]string{argv0, runHelperMagic}, argv...)
+		helperPid, err := syscall.ForkExec(execPath, helperArgv, &syscall.ProcAttr{
+			Dir:   "",
+			Env:   os.Environ(),
+			Files: []uintptr{0, 1, 2},
+			Sys:   nil,
+		})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "run_container: fork helper: %v\n", err)
+			os.Exit(1)
+		}
+		containerRunDebugf("fork helper pid=%d", helperPid)
+		if helperPid == 0 {
+			runHelperDelayedTasks()
+			os.Exit(0)
+		}
+		if err := prepareAppArmorExecTransition(true); err != nil {
+			fmt.Fprintf(os.Stderr, "run_container: %v\n", err)
+			os.Exit(1)
+		}
+		if err := dropPrivilegesForFinalExecIfRequested(); err != nil {
+			fmt.Fprintf(os.Stderr, "run_container: drop privileges before exec: %v\n", err)
+			os.Exit(1)
+		}
+		if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
+			containerRunDebugf("before exec current label=%q", strings.TrimSpace(string(b)))
+		} else {
+			containerRunDebugf("before exec read /proc/self/attr/current failed: %v", err)
+		}
+		execEnv := filterSupervisordInternalEnv(os.Environ())
+		containerRunDebugf("exec target=%q argv=%q env_count=%d", target, argv, len(execEnv))
+		if err := unix.Exec(target, argv, execEnv); err != nil {
+			fmt.Fprintf(os.Stderr, "run_container: exec %s: %v\n", target, err)
+			os.Exit(1)
+		}
+		return true
+	}
+
+	// 非 /init：AppArmor exec 属性作用于「下一次 execve」。若先 ForkExec helper，会消费掉 transition；
+	// 且 PID 1 上写 /proc/self/attr/exec 常被跳过/拒绝。因此在 fork helper **之前**先 ForkExec 门闩子进程
+	//（通常为 ns 内 pid 2），由子进程排队 profile 并 exec 网关；本进程（PID 1）仅负责 reap。
+	gateArgv := append([]string{argv0, runGateExecMagic}, argv...)
+	gatePid, err := syscall.ForkExec(execPath, gateArgv, &syscall.ProcAttr{
+		Dir:   "",
+		Env:   os.Environ(),
+		Files: []uintptr{0, 1, 2},
+		Sys:   nil,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "run_container: fork gate child: %v\n", err)
+		os.Exit(1)
+	}
+	containerRunDebugf("fork gate child pid=%d (AppArmor + final exec delegated)", gatePid)
+
+	helperArgv := append([]string{argv0, runHelperMagic}, argv...)
+	helperPid, err := syscall.ForkExec(execPath, helperArgv, &syscall.ProcAttr{
 		Dir:   "",
 		Env:   os.Environ(),
 		Files: []uintptr{0, 1, 2},
@@ -104,17 +289,14 @@ func handleRunContainer() bool {
 		fmt.Fprintf(os.Stderr, "run_container: fork helper: %v\n", err)
 		os.Exit(1)
 	}
+	containerRunDebugf("fork helper pid=%d", helperPid)
 	if helperPid == 0 {
-		// helper 子进程：执行延迟任务后退出
 		runHelperDelayedTasks()
 		os.Exit(0)
 	}
-	// 父进程（run_container）：exec /init，让 init 继承当前 PID，成为 PID 1
-	// exec 不会返回；若失败则 Exit
-	if err := unix.Exec(target, argv, os.Environ()); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: exec %s: %v\n", target, err)
-		os.Exit(1)
-	}
+
+	fmt.Fprintf(os.Stderr, "run_container: pid=1 supervisor: gateway in child pid=%d helper pid=%d\n", gatePid, helperPid)
+	runContainerChildReaperLoop()
 	return true
 }
 
