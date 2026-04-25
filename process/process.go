@@ -471,14 +471,17 @@ func (p *Process) createProgramCommand() error {
 	if err != nil {
 		return err
 	}
-	if p.setUser() != nil {
-		log.WithFields(log.Fields{"user": p.config.GetString("user", "")}).Error("fail to run as user")
-		return fmt.Errorf("fail to set user")
-	}
+	// 必须先于 setUser()：当 [program] 配置了 environment= 时，setEnv 会重建 p.cmd.Env；
+	// 若 setUser 在前，为 container_run 注入的 SUPERVISORD_TARGET_* 会被覆盖并丢失，导致 __run_container__
+	// 最终 exec 时无法降权到 user= 指定的非 root 用户。
 	p.setProgramRestartChangeMonitor(programPath)
 	setDeathsig(p.cmd.SysProcAttr)
 	setContainerRun(p.cmd.SysProcAttr, p.config)
 	p.setEnv()
+	if p.setUser() != nil {
+		log.WithFields(log.Fields{"user": p.config.GetString("user", "")}).Error("fail to run as user")
+		return fmt.Errorf("fail to set user")
+	}
 	hasTargetUID := false
 	hasTargetGID := false
 	hasAppArmorExec := false

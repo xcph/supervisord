@@ -228,14 +228,28 @@ func joinNamespaces(targetPid int) error {
 		return fmt.Errorf("unshare CLONE_FS: %w", err)
 	}
 
-	skipOnErr := map[string]bool{"user": true, "cgroup": true}
-	debug := debugEnabled(os.Getenv("EXEC_IN_NS_DEBUG"))
+	// In unprivileged containers, setns(2) to user/mnt/cgroup often returns EPERM or EINVAL; we still try
+	// to join net/uts/ipc. For pid: if we could not join the target **mnt** namespace, joining only **pid**
+	// while keeping the host/container mount namespace breaks /proc/self and procps ("fatal library error, lookup self").
+	// In that case we skip the target pid namespace so mnt+pid+procfs stay consistent.
+	// - EPERM/EACCES: always log warning (actionable: caps / security policy).
+	// - EINVAL on user/cgroup: common, noisy — only print when EXEC_IN_NS_DEBUG=1.
+	de := debugEnabled(os.Getenv("EXEC_IN_NS_DEBUG"))
+	mntSkipped := false
 	for i, fd := range fds {
+		if nsNames[i] == "pid" && mntSkipped {
+			fmt.Fprintf(os.Stderr, "exec-in-ns: warning: not joining target pid namespace because mount namespace was not joined (avoids broken /proc/self; tools like ps work in this mode)\n")
+			continue
+		}
 		if err := unix.Setns(fd, nsTypes[i]); err != nil {
-			if skipOnErr[nsNames[i]] && (errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EPERM)) {
-				// Common in unprivileged containers; avoid stderr noise unless EXEC_IN_NS_DEBUG=1.
-				if debug {
-					fmt.Fprintf(os.Stderr, "exec-in-ns: skip %s ns (setns: %v)\n", nsNames[i], err)
+			if setnsCanSkipSetnsError(nsNames[i], err) {
+				if setnsShouldWarnSetnsSkip(nsNames[i], err) {
+					fmt.Fprintf(os.Stderr, "exec-in-ns: warning: cannot join %s namespace, continuing: %v\n", nsNames[i], err)
+				} else if de {
+					fmt.Fprintf(os.Stderr, "exec-in-ns: skip %s namespace (setns: %v)\n", nsNames[i], err)
+				}
+				if nsNames[i] == "mnt" {
+					mntSkipped = true
 				}
 				continue
 			}
@@ -243,6 +257,32 @@ func joinNamespaces(targetPid int) error {
 		}
 	}
 	return nil
+}
+
+// setnsCanSkipSetnsError: namespaces we may omit when the kernel returns permission / compat errors.
+// user/cgroup: common without CAP_SYS_ADMIN. mnt: common in Docker / rootless when joining another task's mnt.
+func setnsCanSkipSetnsError(nsName string, err error) bool {
+	switch nsName {
+	case "user", "cgroup", "mnt":
+		return errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) || errors.Is(err, unix.EINVAL)
+	default:
+		return false
+	}
+}
+
+func setnsShouldWarnSetnsSkip(nsName string, err error) bool {
+	if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+		return true
+	}
+	if !errors.Is(err, unix.EINVAL) {
+		return false
+	}
+	// EINVAL on mnt: unusual; show so operators see something went odd (still continuing).
+	if nsName == "mnt" {
+		return true
+	}
+	// user/cgroup EINVAL: expected in many container/host combos — keep stderr quiet.
+	return false
 }
 
 // execInNamespaceWithPTY joins target's namespaces, creates PTY *inside* the target PID namespace,

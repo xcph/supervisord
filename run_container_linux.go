@@ -84,9 +84,12 @@ func isInitNamespaceTarget(target string) bool {
 	return c == "/init" || c == "/sbin/init"
 }
 
-// runContainerChildReaperLoop runs in PID 1 after delegating the final gateway exec to a child.
-// It reaps the gateway child and keeps the helper subprocess as a sibling until the container stops.
-func runContainerChildReaperLoop() {
+// runContainerChildReaperLoop runs in PID 1 after delegating the final exec to a gate child.
+// When the gate (core service launcher) exits for any reason, the helper is only useful for
+// long-running CNI/restore side tasks; stop it and exit this namespace so the outer supervisord
+// program can go to FATAL/EXITED and restart.
+// If the helper dies first, tear down the gate as well to avoid a lone orphan child.
+func runContainerChildReaperLoop(gatePid, helperPid int) {
 	fmt.Fprintln(os.Stderr, "run_container: pid=1 entering wait loop (gateway child + helper)")
 	for {
 		var ws syscall.WaitStatus
@@ -103,7 +106,60 @@ func runContainerChildReaperLoop() {
 			os.Exit(1)
 		}
 		containerRunDebugf("reaper: reaped pid=%d waitstatus=%v", pid, ws)
+
+		if pid == gatePid {
+			// Core path exited (exec failed, AppArmor, or the managed process exited) — end helper and this wrapper.
+			if helperPid > 0 {
+				if err := syscall.Kill(helperPid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+					fmt.Fprintf(os.Stderr, "run_container: reaper: kill helper pid=%d: %v\n", helperPid, err)
+				} else {
+					fmt.Fprintf(os.Stderr, "run_container: reaper: gate ended; stopped helper pid=%d\n", helperPid)
+					containerRunDebugf("reaper: sent SIGTERM to helper pid=%d", helperPid)
+				}
+				_ = waitProcessExit(helperPid)
+			}
+			os.Exit(exitStatusFromWaitStatus(ws))
+		}
+		if pid == helperPid {
+			// Unexpected: helper died while gate still live — do not leave the gate running alone.
+			if err := syscall.Kill(gatePid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
+				fmt.Fprintf(os.Stderr, "run_container: reaper: helper died; kill gate pid=%d: %v\n", gatePid, err)
+			} else {
+				fmt.Fprintln(os.Stderr, "run_container: reaper: helper died; stopped gate child")
+			}
+			_ = waitProcessExit(gatePid)
+			os.Exit(1)
+		}
 	}
+}
+
+func waitProcessExit(p int) syscall.WaitStatus {
+	for {
+		var w syscall.WaitStatus
+		_, err := syscall.Wait4(p, &w, 0, nil)
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return 0
+		}
+		return w
+	}
+}
+
+func exitStatusFromWaitStatus(ws syscall.WaitStatus) int {
+	if ws.Signaled() {
+		// 128+signal is a common shell convention; cap at 255.
+		c := 128 + int(ws.Signal())
+		if c > 255 {
+			return 255
+		}
+		return c
+	}
+	if ws.Exited() {
+		return ws.ExitStatus()
+	}
+	return 1
 }
 
 // handleRunGateExec runs when invoked as:
@@ -296,7 +352,7 @@ func handleRunContainer() bool {
 	}
 
 	fmt.Fprintf(os.Stderr, "run_container: pid=1 supervisor: gateway in child pid=%d helper pid=%d\n", gatePid, helperPid)
-	runContainerChildReaperLoop()
+	runContainerChildReaperLoop(gatePid, helperPid)
 	return true
 }
 
