@@ -29,6 +29,13 @@ import (
 // errStopRequestedDuringStartFileWait is returned when stopByUser becomes true while waiting on start_when_file.
 var errStopRequestedDuringStartFileWait = errors.New("stop requested while waiting for start_when_file")
 
+// startDrainAfterStop* — When Stop returns while a prior Start/run goroutine still holds inStart=true
+// (e.g. REST stop with Wait:false), the next Start must wait for that goroutine to finish draining.
+const (
+	startDrainAfterStopPoll = 50 * time.Millisecond
+	startDrainAfterStopMax  = 90 * time.Second
+)
+
 // State the state of process
 type State int
 
@@ -149,17 +156,30 @@ func (p *Process) addToCron() {
 //	wait - true, wait the program started or failed
 func (p *Process) Start(wait bool) {
 	log.WithFields(log.Fields{"program": p.GetName()}).Info("try to start program")
-	p.lock.Lock()
-	if p.inStart {
-		log.WithFields(log.Fields{"program": p.GetName()}).Info("Don't start program again, program is already started")
+	deadline := time.Now().Add(startDrainAfterStopMax)
+	for {
+		p.lock.Lock()
+		if !p.inStart {
+			// 必须在 Unlock 之前置位，否则并发两次 Start() 可能都通过 inStart 检查，拉起重复子进程。
+			p.inStart = true
+			p.stopByUser = false
+			p.lock.Unlock()
+			break
+		}
+		drainingAfterStop := p.stopByUser
 		p.lock.Unlock()
+		if drainingAfterStop {
+			if time.Now().After(deadline) {
+				log.WithFields(log.Fields{"program": p.GetName()}).Warn(
+					"Start: timeout waiting for prior run to drain after stop (inStart still true)")
+				return
+			}
+			time.Sleep(startDrainAfterStopPoll)
+			continue
+		}
+		log.WithFields(log.Fields{"program": p.GetName()}).Info("Don't start program again, program is already started")
 		return
 	}
-
-	// 必须在 Unlock 之前置位，否则并发两次 Start() 可能都通过 inStart 检查，拉起重复子进程。
-	p.inStart = true
-	p.stopByUser = false
-	p.lock.Unlock()
 
 	var runCond *sync.Cond
 	if wait {
