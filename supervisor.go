@@ -39,7 +39,9 @@ type Supervisor struct {
 // StartProcessArgs arguments for starting a process
 type StartProcessArgs struct {
 	Name string // program name
-	Wait bool   `default:"true"` // Wait the program starting finished
+	Wait bool `default:"true"` // Wait the program starting finished (start); wait for graceful stop/shutdown completion (stop)
+	// Immediate, when StopProcess(N): SIGKILL immediately, skip stopsignal/grace periods; combine with Wait=false to return without waiting for exit (REST ?immediate=true sets both).
+	Immediate bool `default:"false"`
 }
 
 // ProcessStdin  process stdin from client
@@ -304,7 +306,7 @@ func (s *Supervisor) StopProcess(r *http.Request, args *StartProcessArgs, reply 
 		return fmt.Errorf("fail to find process %s", args.Name)
 	}
 	for _, proc := range procs {
-		proc.Stop(args.Wait)
+		proc.Stop(args.Wait, args.Immediate)
 	}
 	reply.Success = true
 	return nil
@@ -316,7 +318,7 @@ func (s *Supervisor) StopProcessGroup(r *http.Request, args *StartProcessArgs, r
 	finishedProcCh := make(chan *process.Process)
 	n := s.procMgr.AsyncForEachProcess(func(proc *process.Process) {
 		if proc.GetGroup() == args.Name {
-			proc.Stop(args.Wait)
+			proc.Stop(args.Wait, args.Immediate)
 		}
 	}, finishedProcCh)
 
@@ -336,7 +338,7 @@ func (s *Supervisor) StopAllProcesses(r *http.Request, args *struct {
 	finishedProcCh := make(chan *process.Process)
 
 	n := s.procMgr.AsyncForEachProcess(func(proc *process.Process) {
-		proc.Stop(args.Wait)
+		proc.Stop(args.Wait, false)
 	}, finishedProcCh)
 
 	for i := 0; i < n; i++ {
@@ -466,7 +468,7 @@ func (s *Supervisor) Reload(restart bool) (addedGroup []string, changedGroup []s
 		s.config.RemoveProgram(removedProg)
 		proc := s.procMgr.Remove(removedProg)
 		if proc != nil {
-			proc.Stop(false)
+			proc.Stop(false, false)
 		}
 
 	}

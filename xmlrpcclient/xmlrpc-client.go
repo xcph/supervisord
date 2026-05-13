@@ -362,14 +362,16 @@ func (r *XMLRPCClient) StartProcess(process string, wait bool) (reply types.Bool
 	return
 }
 
-// StopProcess Stop a process named by name
-func (r *XMLRPCClient) StopProcess(process string, wait bool) (reply types.BooleanReply, err error) {
+// StopProcess Stop a process named by name. If immediate is true, supervisord sends SIGKILL without graceful stop waits.
+func (r *XMLRPCClient) StopProcess(process string, wait bool, immediate bool) (reply types.BooleanReply, err error) {
 	ins := struct {
-		Name string
-		Wait bool
+		Name      string
+		Wait      bool
+		Immediate bool
 	}{
-		Name: process,
-		Wait: wait,
+		Name:      process,
+		Wait:      wait,
+		Immediate: immediate,
 	}
 	r.post("supervisor.stopProcess", &ins, func(body io.ReadCloser, procError error) {
 		err = procError

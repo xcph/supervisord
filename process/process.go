@@ -1,6 +1,7 @@
 package process
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -24,6 +25,9 @@ import (
 	"github.com/robfig/cron/v3"
 	log "github.com/sirupsen/logrus"
 )
+
+// errStopRequestedDuringStartFileWait is returned when stopByUser becomes true while waiting on start_when_file.
+var errStopRequestedDuringStartFileWait = errors.New("stop requested while waiting for start_when_file")
 
 // State the state of process
 type State int
@@ -530,7 +534,7 @@ func (p *Process) setProgramRestartChangeMonitor(programPath string) {
 			} else if len(s) > 0 {
 				p.sendSignals(strings.Fields(s), true)
 			} else {
-				p.Stop(true)
+				p.Stop(true, false)
 				p.Start(true)
 			}
 
@@ -557,7 +561,7 @@ func (p *Process) setProgramRestartChangeMonitor(programPath string) {
 			} else if len(s) > 0 {
 				p.sendSignals(strings.Fields(s), true)
 			} else {
-				p.Stop(true)
+				p.Stop(true, false)
 				p.Start(true)
 			}
 		})
@@ -596,9 +600,59 @@ func (p *Process) waitForExit(startSecs int64) {
 
 // fail to start the program
 func (p *Process) failToStartProgram(reason string, finishCb func()) {
-	log.WithFields(log.Fields{"program": p.GetName()}).Errorf(reason)
+	log.WithFields(log.Fields{"program": p.GetName()}).Error(reason)
 	p.changeStateTo(Fatal)
 	finishCb()
+}
+
+// waitForStartFileIfConfigured blocks until start_when_file exists as a non-directory path
+// (regular file, fifo, socket, etc.), or deadline elapses, or stopByUser.
+// Caller must not hold p.lock.
+func (p *Process) waitForStartFileIfConfigured() error {
+	path := strings.TrimSpace(p.config.GetString("start_when_file", ""))
+	if path == "" {
+		return nil
+	}
+
+	timeoutSecs := p.config.GetInt("start_when_file_timeout", 0)
+	pollSecs := p.config.GetInt("start_when_file_poll_secs", 1)
+	if pollSecs < 1 {
+		pollSecs = 1
+	}
+	poll := time.Duration(pollSecs) * time.Second
+
+	var deadline time.Time
+	if timeoutSecs > 0 {
+		deadline = time.Now().Add(time.Duration(timeoutSecs) * time.Second)
+	}
+
+	log.WithFields(log.Fields{
+		"program":                  p.GetName(),
+		"start_when_file":          path,
+		"start_when_file_timeout":  timeoutSecs,
+		"start_when_file_poll_secs": pollSecs,
+	}).Info("waiting for start_when_file before launching command")
+
+	for {
+		p.lock.Lock()
+		stopped := p.stopByUser
+		p.lock.Unlock()
+		if stopped {
+			return errStopRequestedDuringStartFileWait
+		}
+
+		fi, err := os.Stat(path)
+		if err == nil && !fi.IsDir() {
+			log.WithFields(log.Fields{"program": p.GetName(), "start_when_file": path}).Info("start_when_file present, proceeding with launch")
+			return nil
+		}
+
+		if timeoutSecs > 0 && time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for start_when_file %q (%ds)", path, timeoutSecs)
+		}
+
+		time.Sleep(poll)
+	}
 }
 
 // monitor if the program is in running before endTime
@@ -656,6 +710,19 @@ func (p *Process) run(finishCb func()) {
 			time.Sleep(time.Duration(restartPause) * time.Second)
 			p.lock.Lock()
 		}
+		p.lock.Unlock()
+		if err := p.waitForStartFileIfConfigured(); err != nil {
+			p.lock.Lock()
+			if errors.Is(err, errStopRequestedDuringStartFileWait) {
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("abort start: stopped while waiting for start_when_file")
+				p.changeStateTo(Stopped)
+				finishCbWrapper()
+				break
+			}
+			p.failToStartProgram(err.Error(), finishCbWrapper)
+			break
+		}
+		p.lock.Lock()
 		endTime := time.Now().Add(time.Duration(startSecs) * time.Second)
 		p.changeStateTo(Starting)
 		atomic.AddInt32(p.retryTimes, 1)
@@ -882,13 +949,22 @@ func (p *Process) sendSignal(sig os.Signal, sigChildren bool) error {
 func (p *Process) setEnv() {
 	envFromFiles := p.config.GetEnvFromFiles("envFiles")
 	env := p.config.GetEnv("environment")
+	envOverlay := p.config.GetEnvFromFiles("envFilesOverlay")
+
+	var base []string
 	if len(env)+len(envFromFiles) != 0 {
 		// envFiles + [program]environment 必须先于 os.Environ 参与 merge：旧顺序把 os 放在前，
 		// 导致 program 中的 HOME= 等无法覆盖 supervisord（root）继承的环境，user=node 子进程仍带
 		// HOME=/root，常见后果是 OpenClaw 读错配置路径后秒退 → supervisord 报 Fatal。
-		p.cmd.Env = mergeKeyValueArrays(append(envFromFiles, env...), os.Environ())
+		base = mergeKeyValueArrays(append(envFromFiles, env...), os.Environ())
 	} else {
-		p.cmd.Env = mergeKeyValueArrays(p.cmd.Env, os.Environ())
+		base = mergeKeyValueArrays(p.cmd.Env, os.Environ())
+	}
+	// envFilesOverlay / runtime .env：在 environment= 与 envFiles 之后合并，便于 API 持久化覆盖同名字段。
+	if len(envOverlay) > 0 {
+		p.cmd.Env = mergeKeyValueArrays(envOverlay, base)
+	} else {
+		p.cmd.Env = base
 	}
 	// Persist resolv.conf in supervisord namespace to shared path.
 	// The container-run helper (init namespace) reads /shared/etc/resolv.conf and writes to /system/etc/resolv.conf.
@@ -1184,8 +1260,10 @@ func filterRootEnv(env *[]string) {
 	*env = filtered
 }
 
-// Stop sends signal to process to make it quit
-func (p *Process) Stop(wait bool) {
+// Stop sends signal to process to make it quit.
+// If immediate is true, sends SIGKILL immediately (same effect as kill -9 for the supervised process tree when killasgroup applies).
+// If wait is false, returns once the kill path has been launched without waiting for the process to exit.
+func (p *Process) Stop(wait bool, immediate bool) {
 	p.lock.Lock()
 	p.stopByUser = true
 	isRunning := p.isRunning()
@@ -1194,12 +1272,9 @@ func (p *Process) Stop(wait bool) {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("program is not running")
 		return
 	}
-  
+
 	log.WithFields(log.Fields{"program": p.GetName()}).Info("stopping the program")
 	p.changeStateTo(Stopping)
-	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
-	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second
-	killwaitsecs := time.Duration(p.config.GetInt("killwaitsecs", 2)) * time.Second
 	stopasgroup := p.config.GetBool("stopasgroup", false)
 	killasgroup := p.config.GetBool("killasgroup", stopasgroup)
 	if stopasgroup && !killasgroup {
@@ -1207,6 +1282,24 @@ func (p *Process) Stop(wait bool) {
 	}
 
 	var stopped int32 = 0
+	if immediate {
+		go func() {
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("immediate stop: SIGKILL")
+			p.Signal(syscall.SIGKILL, killasgroup)
+			atomic.StoreInt32(&stopped, 1)
+		}()
+		if wait {
+			for atomic.LoadInt32(&stopped) == 0 {
+				time.Sleep(10 * time.Millisecond)
+			}
+		}
+		return
+	}
+
+	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
+	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second
+	killwaitsecs := time.Duration(p.config.GetInt("killwaitsecs", 2)) * time.Second
+
 	go func() {
 		for i := 0; i < len(sigs) && atomic.LoadInt32(&stopped) == 0; i++ {
 			// send signal to process

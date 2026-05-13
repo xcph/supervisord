@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +23,7 @@ type CtlCommand struct {
 	User      string `short:"u" long:"user" description:"the user name"`
 	Password  string `short:"P" long:"password" description:"the password"`
 	Verbose   bool   `short:"v" long:"verbose" description:"Show verbose debug information"`
+	Debug     bool   `long:"debug" description:"Print curl-equivalent commands to stderr for HTTP-based ctl operations (get-env, set-env, unset-env, logtail)"`
 }
 
 // StatusCommand get the status of all supervisor managed programs
@@ -55,6 +60,20 @@ type SignalCommand struct {
 
 // LogtailCommand tail the stdout/stderr log of program through http interface
 type LogtailCommand struct {
+}
+
+// GetEnvCommand 读取 program 的 envFilesOverlay 持久化文件（HTTP GET）
+type GetEnvCommand struct {
+}
+
+// SetEnvCommand 单键写入持久化 env（HTTP PATCH）
+type SetEnvCommand struct {
+	Restart bool `long:"restart" description:"Restart program after updating env"`
+}
+
+// UnsetEnvCommand 从持久化 env 删除单键（HTTP PATCH + delete）
+type UnsetEnvCommand struct {
+	Restart bool `long:"restart" description:"Restart program after updating env"`
 }
 
 // ExecCommand enter program's namespace and run shell or command (kubectl-exec-like: -i -t, optional -- before command).
@@ -103,6 +122,9 @@ var reloadCommand = CmdCheckWrapperCommand{&ReloadCommand{}, 0, ""}
 var pidCommand = CmdCheckWrapperCommand{&PidCommand{}, 1, "pid <program>"}
 var signalCommand = CmdCheckWrapperCommand{&SignalCommand{}, 2, "signal <signal_name> <program>[...]"}
 var logtailCommand = CmdCheckWrapperCommand{&LogtailCommand{}, 1, "logtail <program>"}
+var getEnvCommand = CmdCheckWrapperCommand{&GetEnvCommand{}, 1, "get-env <program>"}
+var setEnvCommand = CmdCheckWrapperCommand{&SetEnvCommand{}, 3, "set-env [--restart] <program> <key> <value...>"}
+var unsetEnvCommand = CmdCheckWrapperCommand{&UnsetEnvCommand{}, 2, "unset-env [--restart] <program> <key>"}
 var execWrapper = &execCheckWrapper{}
 
 func (x *CtlCommand) getServerURL() string {
@@ -160,6 +182,73 @@ func (x *CtlCommand) createRPCClient() *xmlrpcclient.XMLRPCClient {
 	rpcc.SetUser(x.getUser())
 	rpcc.SetPassword(x.getPassword())
 	return rpcc
+}
+
+func shellSingleQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, r := range s {
+		if r == '\'' {
+			b.WriteString(`'"'"'`)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
+// printCurlEquivalent 输出发往 HTTP 接口时可手工执行的 curl 命令（含 Basic Auth 与 JSON body）。
+func (x *CtlCommand) printCurlEquivalent(method, reqURL string, body []byte) {
+	if !x.Debug {
+		return
+	}
+	var sb strings.Builder
+	sb.WriteString("curl -sS")
+	u, p := x.getUser(), x.getPassword()
+	if u != "" || p != "" {
+		sb.WriteString(" -u ")
+		sb.WriteString(shellSingleQuote(u + ":" + p))
+	}
+	sb.WriteString(" -X ")
+	sb.WriteString(method)
+	sb.WriteString(" ")
+	sb.WriteString(shellSingleQuote(reqURL))
+	if len(body) > 0 {
+		sb.WriteString(" -H ")
+		sb.WriteString(shellSingleQuote("Content-Type: application/json"))
+		sb.WriteString(" -d ")
+		sb.WriteString(shellSingleQuote(string(body)))
+	}
+	_, _ = fmt.Fprintln(os.Stderr, sb.String())
+}
+
+func (x *CtlCommand) programEnvHTTP(method, program string, query url.Values, body []byte) ([]byte, int, error) {
+	base := strings.TrimSuffix(x.getServerURL(), "/")
+	u := base + "/program/" + url.PathEscape(program) + "/env"
+	if len(query) > 0 {
+		u += "?" + query.Encode()
+	}
+	x.printCurlEquivalent(method, u, body)
+	var r io.Reader
+	if body != nil {
+		r = bytes.NewReader(body)
+	}
+	req, err := http.NewRequest(method, u, r)
+	if err != nil {
+		return nil, 0, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	req.SetBasicAuth(x.getUser(), x.getPassword())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return respBody, resp.StatusCode, err
 }
 
 // Execute implements flags.Commander interface to execute the control commands
@@ -525,6 +614,73 @@ func (pc *PidCommand) Execute(args []string) error {
 	return nil
 }
 
+func (g *GetEnvCommand) Execute(args []string) error {
+	b, code, err := ctlCommand.programEnvHTTP("GET", args[0], nil, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	_, _ = os.Stdout.Write(b)
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		fmt.Fprintln(os.Stdout)
+	}
+	if code >= 400 {
+		os.Exit(1)
+	}
+	return nil
+}
+
+func (s *SetEnvCommand) Execute(args []string) error {
+	prog, key := args[0], args[1]
+	val := strings.Join(args[2:], " ")
+	raw, err := json.Marshal(map[string]string{"key": key, "value": val})
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if s.Restart {
+		q.Set("restart", "true")
+	}
+	b, code, err := ctlCommand.programEnvHTTP("PATCH", prog, q, raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	_, _ = os.Stdout.Write(b)
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		fmt.Fprintln(os.Stdout)
+	}
+	if code >= 400 {
+		os.Exit(1)
+	}
+	return nil
+}
+
+func (u *UnsetEnvCommand) Execute(args []string) error {
+	prog, key := args[0], args[1]
+	raw, err := json.Marshal(map[string]any{"key": key, "delete": true})
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	if u.Restart {
+		q.Set("restart", "true")
+	}
+	b, code, err := ctlCommand.programEnvHTTP("PATCH", prog, q, raw)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	_, _ = os.Stdout.Write(b)
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		fmt.Fprintln(os.Stdout)
+	}
+	if code >= 400 {
+		os.Exit(1)
+	}
+	return nil
+}
+
 // Execute enter program's namespace and run shell or command
 func (ec *ExecCommand) Execute(args []string) error {
 	ctlCommand.exec(ctlCommand.createRPCClient(), args, ec.Stdin, ec.Tty)
@@ -547,6 +703,7 @@ func (lc *LogtailCommand) tailLog(program string, dev string) error {
 		return err
 	}
 	url := fmt.Sprintf("%s/logtail/%s/%s", ctlCommand.getServerURL(), program, dev)
+	ctlCommand.printCurlEquivalent("GET", url, nil)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
@@ -623,6 +780,18 @@ func init() {
 		"get the standard output&standard error of the program",
 		"get the standard output&standard error of the program",
 		&logtailCommand)
+	ctlCmd.AddCommand("get-env",
+		"get persisted runtime env (envFilesOverlay file)",
+		"GET /program/{name}/env — same as curl with --debug to print the request",
+		&getEnvCommand)
+	ctlCmd.AddCommand("set-env",
+		"set one key in persisted runtime env",
+		"PATCH /program/{name}/env with key+value; use --restart to restart the program",
+		&setEnvCommand)
+	ctlCmd.AddCommand("unset-env",
+		"remove one key from persisted runtime env",
+		"PATCH /program/{name}/env with delete; use --restart to restart the program",
+		&unsetEnvCommand)
 	ctlCmd.AddCommand("exec",
 		"enter program's namespace and run shell or command",
 		"Like kubectl exec: -i/-t, optional -- then command. A lone sh/bash/ash/ksh attaches stdin automatically. Examples: ctl exec init -- sh ; ctl exec -it init -- /bin/sh ; ctl exec init -- ls -la",

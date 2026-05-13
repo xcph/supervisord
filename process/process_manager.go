@@ -193,7 +193,7 @@ func (pm *Manager) StopAllProcesses() {
 		go func(wg *sync.WaitGroup) {
 			defer wg.Done()
 
-			proc.Stop(true)
+			proc.Stop(true, false)
 		}(&wg)
 	})
 

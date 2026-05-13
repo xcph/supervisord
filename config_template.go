@@ -41,6 +41,13 @@ process_name=%(program_name)s
 numprocs=1
 #numprocs_start=not support
 autostart=true
+# Wait until path exists before each launch attempt (empty = disabled).
+# Applies to RPC start and autostart. Non-directory path only (file, fifo, unix socket OK).
+start_when_file=
+# Seconds to wait (0 = no limit). Recommended when using start_when_file.
+start_when_file_timeout=0
+# Poll interval seconds while waiting.
+start_when_file_poll_secs=1
 startsecs=3
 startretries=3
 autorestart=true
@@ -76,6 +83,7 @@ stderr_capture_maxbytes=0
 stderr_events_enabled=false
 environment=KEY="val",KEY2="val2"
 envFiles=global.env,prod.env
+envFilesOverlay=/etc/supervisord/env.d/my_program.env
 directory=/tmp
 #umask=not support
 serverurl=AUTO
@@ -117,6 +125,7 @@ stderr_capture_maxbytes=0
 stderr_events_enabled=false
 environment=KEY="val",KEY2="val2"
 envFiles=global.env,prod.env
+envFilesOverlay=/etc/supervisord/env.d/my_program.env
 directory=/tmp
 #umask=not support
 serverurl=AUTO

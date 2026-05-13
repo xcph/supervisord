@@ -79,6 +79,28 @@ func dropPrivilegesForFinalExecIfRequested() error {
 // programmed (Cilium: /32 + default via x.x.x.2) and restore periodically. Calico uses 169.254.1.1.
 const cniBootstrapDir = "/shared/cni-bootstrap"
 
+// androidBootStatusPropPath is Android runtime property area for sys.boot_completed (redroid/AOSP).
+const androidBootStatusPropPath = "/dev/__properties__/u:object_r:boot_status_prop:s0"
+
+// shouldWaitAndroidBootForHelper decides whether the __run_helper__ path should poll boot_completed.
+// OpenClaw gateway-only images use container_run with a shell/node target (not /init): waiting 5m on a
+// missing property file only burns time. Android/redroid pods pass target /init or /sbin/init.
+//
+// RUN_CONTAINER_ANDROID_BOOT_WAIT: "1"/"true" force wait; "0"/"false" force skip; unset = auto from target.
+func shouldWaitAndroidBootForHelper() bool {
+	e := strings.ToLower(strings.TrimSpace(os.Getenv("RUN_CONTAINER_ANDROID_BOOT_WAIT")))
+	if e == "0" || e == "false" || e == "no" {
+		return false
+	}
+	if e == "1" || e == "true" || e == "yes" {
+		return true
+	}
+	if len(os.Args) >= 3 {
+		return isInitNamespaceTarget(os.Args[2])
+	}
+	return false
+}
+
 func isInitNamespaceTarget(target string) bool {
 	c := filepath.Clean(target)
 	return c == "/init" || c == "/sbin/init"
@@ -499,7 +521,11 @@ func runProcfsSimulatorAfterInit() {
 	if v != "true" && v != "1" {
 		return
 	}
-	const propPath = "/dev/__properties__/u:object_r:boot_status_prop:s0"
+	if !shouldWaitAndroidBootForHelper() {
+		fmt.Fprintf(os.Stderr, "run_container: skip procfs-simulator (non-Android helper target; set RUN_CONTAINER_ANDROID_BOOT_WAIT=1 to force)\n")
+		return
+	}
+	const propPath = androidBootStatusPropPath
 	const maxWait = 5 * time.Minute
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
@@ -611,7 +637,11 @@ func writeSystemResolvConf() {
 // writeSystemResolvConfAfterBootCompleted waits until Android boot is completed
 // and then writes /system/etc/resolv.conf.
 func writeSystemResolvConfAfterBootCompleted() {
-	const propPath = "/dev/__properties__/u:object_r:boot_status_prop:s0"
+	if !shouldWaitAndroidBootForHelper() {
+		fmt.Fprintf(os.Stderr, "run_container: skip /system/etc/resolv.conf boot_completed wait (non-Android helper target; set RUN_CONTAINER_ANDROID_BOOT_WAIT=1 to force)\n")
+		return
+	}
+	const propPath = androidBootStatusPropPath
 	const maxWait = 5 * time.Minute
 	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {

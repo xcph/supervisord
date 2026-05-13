@@ -139,6 +139,12 @@ supervisord
 
 > **说明**：AppArmor 的 `exec` 过渡绑定在「下一次 `execve`」。若先 **ForkExec** helper，会 **消费** 掉已排队的 transition；且对 **PID 1** 写 `attr/exec` 常被跳过或失败。因此对非 init 目标采用 **gate 子进程（pid≠1）** 排队 profile 再 `exec` 网关；PID 1 专职 **reap**。
 
+### Helper：`boot_completed` 与 `/system/etc/resolv.conf`
+
+- **`writeSystemResolvConfAfterBootCompleted`** 与 **`runProcfsSimulatorAfterInit`**（当 `PROCFS_SIMULATOR_ENABLED` 启用时）仅在 **判定为 Android 运行时** 才轮询 `sys.boot_completed`（最长约 5 分钟）；否则会立刻跳过并打 stderr 提示，避免纯网关容器在无属性文件时空转。
+- **默认判定**：`__run_helper__` 携带的原始 **exec target** 为 **`/init` 或 `/sbin/init`** 时视为 Android/redroid；网关镜像常见 target 为 `openclaw-gateway-exec.sh` 等，将 **不等待**。
+- **覆盖**：环境变量 **`RUN_CONTAINER_ANDROID_BOOT_WAIT`**：`1`/`true` 强制等待；`0`/`false` 强制跳过；未设置则按 target 自动判断。
+
 ---
 
 ## 三、对照表
