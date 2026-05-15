@@ -34,7 +34,7 @@ supervisord ──fork/exec──► program（业务进程）
 3. **`setUser()`**（若配置了 `user=`）  
    - 解析 uid/gid。  
    - **`setUserID`**：在 `SysProcAttr.Credential` 中设置 `Uid`/`Gid`（`NoSetGroups: true`），由内核在子进程 **`exec` 时**完成降权。  
-   - 合并/覆盖 `HOME`、`USER`、`LOGNAME`、`PATH`，并过滤部分 root 遗留环境变量。
+   - 合并/覆盖 `HOME`、`USER`、`LOGNAME`；若合并后已有非空 `PATH` 则保留（镜像 `ENV`、`[program] environment=`、overlay 等），否则写入默认「安全 PATH」。并过滤部分 root 遗留环境变量。
 
 4. **`setDeathsig`**  
    子进程在父进程异常退出时可收到信号（平台相关）。

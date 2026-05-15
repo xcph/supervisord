@@ -22,3 +22,22 @@ func TestMergeKeyValueArraysProgramOverridesOsHome(t *testing.T) {
 		t.Fatalf("expected PATH from system, got %q", path)
 	}
 }
+
+func TestEnvSliceLookupPath(t *testing.T) {
+	env := []string{"HOME=/home/node", "PATH=/home/node/.venv/bin:/usr/local/bin"}
+	v, ok := envSliceLookup(env, "PATH")
+	if !ok || v != "/home/node/.venv/bin:/usr/local/bin" {
+		t.Fatalf("unexpected PATH lookup: ok=%v v=%q", ok, v)
+	}
+	_, ok2 := envSliceLookup(env, "MISSING")
+	if ok2 {
+		t.Fatalf("expected missing key ok=false")
+	}
+}
+
+func TestEnvSliceLookupEmptyValue(t *testing.T) {
+	v, ok := envSliceLookup([]string{"PATH="}, "PATH")
+	if !ok || v != "" {
+		t.Fatalf("expected PATH= empty, ok=%v v=%q", ok, v)
+	}
+}

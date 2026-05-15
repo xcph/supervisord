@@ -251,7 +251,7 @@ func (p *Process) GetDescription() string {
 		}
 		return fmt.Sprintf("pid %d, uptime %d:%02d:%02d", p.cmd.Process.Pid, hours%24, minutes%60, seconds%60)
 	} else if p.state != Stopped {
-                if p.stopTime.Unix() > 0 {
+		if p.stopTime.Unix() > 0 {
 			return p.stopTime.String()
 		}
 	}
@@ -647,9 +647,9 @@ func (p *Process) waitForStartFileIfConfigured() error {
 	}
 
 	log.WithFields(log.Fields{
-		"program":                  p.GetName(),
-		"start_when_file":          path,
-		"start_when_file_timeout":  timeoutSecs,
+		"program":                   p.GetName(),
+		"start_when_file":           path,
+		"start_when_file_timeout":   timeoutSecs,
 		"start_when_file_poll_secs": pollSecs,
 	}).Info("waiting for start_when_file before launching command")
 
@@ -864,10 +864,10 @@ func (p *Process) run(finishCb func()) {
 			// Child exited (or never reached Running) before monitorProgramIsRunning promoted Starting→Running.
 			// This is normal supervisord behavior when the process dies within startsecs — not "duplicate programs".
 			exitLog := log.Fields{
-				"program":    p.GetName(),
-				"retry":      atomic.LoadInt32(p.retryTimes),
-				"startsecs":  startSecs,
-				"loop_exit":  loopExit,
+				"program":   p.GetName(),
+				"retry":     atomic.LoadInt32(p.retryTimes),
+				"startsecs": startSecs,
+				"loop_exit": loopExit,
 			}
 			if p.cmd != nil && p.cmd.ProcessState != nil {
 				exitLog["process_state"] = p.cmd.ProcessState.String()
@@ -1167,6 +1167,21 @@ func (p *Process) createStderrLogger() logger.Logger {
 	return logger.NewLogger(p.GetName(), logFile, logger.NewNullLocker(), maxBytes, backups, props, logEventEmitter)
 }
 
+// envSliceLookup returns the raw value for key in a KEY=VAL environment slice (os.Environ format).
+func envSliceLookup(env []string, key string) (val string, ok bool) {
+	for _, e := range env {
+		parts := strings.SplitN(e, "=", 2)
+		if len(parts) == 0 || parts[0] != key {
+			continue
+		}
+		if len(parts) == 2 {
+			return parts[1], true
+		}
+		return "", true // "KEY" or "KEY=" with no value
+	}
+	return "", false
+}
+
 func (p *Process) setUser() error {
 	userName := p.config.GetString("user", "")
 	if len(userName) == 0 {
@@ -1219,13 +1234,20 @@ func (p *Process) setUser() error {
 		setUserID(p.cmd.SysProcAttr, uint32(uid), uint32(gid))
 	}
 
-	// 强制设置关键环境变量
+	// 强制设置关键环境变量：HOME/USER/LOGNAME 始终按目标用户覆盖。
+	// PATH：若 setEnv 合并后已有非空 PATH（来自 [program] environment=、envFilesOverlay 或镜像继承），则保留；
+	// 否则使用 defaultPath，避免降权后继承 root 的异常 PATH，同时保证有基本系统路径。
 	p.cmd.Env = appendEnvWithOverride(p.cmd.Env,
 		"HOME", u.HomeDir, // 强制HOME目录
 		"USER", u.Username, // 用户名
 		"LOGNAME", u.Username, // 登录名
-		"PATH", defaultPath(u), // 安全PATH
 	)
+	pathVal, pathOK := envSliceLookup(p.cmd.Env, "PATH")
+	if !pathOK || strings.TrimSpace(pathVal) == "" {
+		p.cmd.Env = appendEnvWithOverride(p.cmd.Env,
+			"PATH", defaultPath(u), // 安全PATH
+		)
+	}
 
 	// 删除root残留的环境变量
 	filterRootEnv(&p.cmd.Env)
