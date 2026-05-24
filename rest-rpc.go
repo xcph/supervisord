@@ -142,7 +142,7 @@ func (sr *SupervisorRestful) RestartProgram(w http.ResponseWriter, req *http.Req
 }
 
 func (sr *SupervisorRestful) _restartProgram(programName string, immediate bool) (bool, error) {
-	if _, err := sr._stopProgram(programName, immediate); err != nil {
+	if err := sr.stopProgramForRestart(programName, immediate, nil); err != nil {
 		return false, err
 	}
 	return sr._startProgram(programName)

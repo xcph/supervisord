@@ -250,7 +250,7 @@ func (sr *SupervisorRestful) respondAfterEnvWrite(w http.ResponseWriter, req *ht
 	wantRestart := req.URL.Query().Get("restart") == "1" || strings.EqualFold(req.URL.Query().Get("restart"), "true")
 	wantImmediateRestart := immediateFromReq(req)
 	if wantRestart {
-		if _, err := sr._stopProgram(name, wantImmediateRestart); err != nil {
+		if err := sr.stopProgramForRestart(name, wantImmediateRestart, final); err != nil {
 			reply.Message = "已写入 env，但 stop 失败: " + err.Error()
 			_ = json.NewEncoder(w).Encode(reply)
 			return

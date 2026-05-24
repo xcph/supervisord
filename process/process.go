@@ -32,8 +32,9 @@ var errStopRequestedDuringStartFileWait = errors.New("stop requested while waiti
 // startDrainAfterStop* — When Stop returns while a prior Start/run goroutine still holds inStart=true
 // (e.g. REST stop with Wait:false), the next Start must wait for that goroutine to finish draining.
 const (
-	startDrainAfterStopPoll = 50 * time.Millisecond
-	startDrainAfterStopMax  = 90 * time.Second
+	startDrainAfterStopPoll         = 50 * time.Millisecond
+	startDrainAfterStopMax          = 90 * time.Second
+	startDrainAfterStopImmediateMax = 15 * time.Second
 )
 
 // State the state of process
@@ -106,7 +107,9 @@ type Process struct {
 	inStart bool
 	// true if the process is stopped by user
 	stopByUser bool
-	retryTimes *int32
+	// set when Stop(immediate=true) runs; Start() uses a shorter inStart drain window.
+	lastImmediateStop time.Time
+	retryTimes        *int32
 	lock       sync.RWMutex
 	stdin      io.WriteCloser
 	StdoutLog  logger.Logger
@@ -156,7 +159,13 @@ func (p *Process) addToCron() {
 //	wait - true, wait the program started or failed
 func (p *Process) Start(wait bool) {
 	log.WithFields(log.Fields{"program": p.GetName()}).Info("try to start program")
-	deadline := time.Now().Add(startDrainAfterStopMax)
+	p.lock.RLock()
+	drainMax := startDrainAfterStopMax
+	if !p.lastImmediateStop.IsZero() && time.Since(p.lastImmediateStop) < 2*time.Minute {
+		drainMax = startDrainAfterStopImmediateMax
+	}
+	p.lock.RUnlock()
+	deadline := time.Now().Add(drainMax)
 	for {
 		p.lock.Lock()
 		if !p.inStart {
@@ -1325,9 +1334,15 @@ func (p *Process) Stop(wait bool, immediate bool) {
 
 	var stopped int32 = 0
 	if immediate {
+		p.lock.Lock()
+		p.lastImmediateStop = time.Now()
+		p.lock.Unlock()
 		go func() {
 			log.WithFields(log.Fields{"program": p.GetName()}).Info("immediate stop: SIGKILL")
-			p.Signal(syscall.SIGKILL, killasgroup)
+			if err := p.Signal(syscall.SIGKILL, killasgroup); err != nil {
+				log.WithFields(log.Fields{"program": p.GetName(), "err": err}).Warn(
+					"immediate SIGKILL failed (container may lack CAP_KILL; use cooperative shutdown for openclaw-init)")
+			}
 			atomic.StoreInt32(&stopped, 1)
 		}()
 		if wait {
