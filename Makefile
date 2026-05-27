@@ -1,5 +1,5 @@
 # 私有仓库、buildx、buildkit-login（与 portgateway/Makefile 对齐；见 make help）。
-# Init 镜像构建上下文为 monorepo 根目录（含 supervisord、cloudphone-nodeagent-api）。
+# Init 镜像构建上下文为 supervisord 仓库根目录（cloudphone-nodeagent-api 为嵌套 submodule）。
 # 推送内网示例: make buildkit-login REGISTRY_USER=... REGISTRY_PASS=... REGISTRY_ENDPOINT=registry.k8s.local:10443
 #             && make docker-buildx IMG=registry.k8s.local:10443/k8s/supervisord-init:v0.1.0 PLATFORMS=linux/amd64,linux/arm64
 
@@ -8,7 +8,7 @@ IMG ?= supervisord-init:latest
 ifneq ($(strip $(IMAGE)),)
 override IMG := $(IMAGE)
 endif
-REPO_ROOT ?= $(abspath ..)
+REPO_ROOT ?= $(abspath .)
 
 ifeq (,$(shell go env GOBIN))
 GOBIN := $(shell go env GOPATH)/bin
@@ -99,7 +99,7 @@ ifneq ($(strip $(PLATFORM)),)
 endif
 
 DOCKER_BUILD_CONTEXT ?= $(REPO_ROOT)
-DOCKERFILE_INIT ?= supervisord/Dockerfile.init
+DOCKERFILE_INIT ?= Dockerfile.init
 # 可选：传给 Dockerfile.init 的 Alpine apk 镜像主机（默认 Dockerfile 为 dl-cdn）
 ALPINE_APK_REPO_HOST ?=
 # 可选：构建期代理（亦可在 shell 中 export，由 buildx 子进程继承；此处显式 --build-arg 便于 make 传参）

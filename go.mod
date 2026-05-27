@@ -59,7 +59,7 @@ require (
 	k8s.io/utils v0.0.0-20241210054802-24370beab758 // indirect
 )
 
-replace github.com/xcph/cloudphone-nodeagent-api => ../cloudphone-nodeagent-api
+replace github.com/xcph/cloudphone-nodeagent-api => ./cloudphone-nodeagent-api
 
 replace (
 	github.com/ochinchina/supervisord/config => ./config

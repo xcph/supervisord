@@ -1,0 +1,3 @@
+[submodule "cloudphone-nodeagent-api"]
+	path = cloudphone-nodeagent-api
+	url = https://github.com/xcph/cloudphone-nodeagent-api.git

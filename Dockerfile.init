@@ -8,7 +8,7 @@
 # 或 shell 中 export 后 make；Makefile 亦会将非空的 HTTP(S)_PROXY/NO_PROXY（及小写形式）传给 buildx。
 # Dockerfile.init builds an image for the init container that copies supervisord
 # and config to a shared volume. Used with cloudphone-operator (init container + emptyDir).
-# Build context must be the monorepo root (parent of supervisord/): it needs supervisord + cloudphone-nodeagent-api for go.mod replace.
+# Build context is the supervisord repository root (cloudphone-nodeagent-api is a nested submodule under ./cloudphone-nodeagent-api).
 # Build with musl (Alpine) for static binary, no glibc dependency.
 FROM golang:1.26.1-alpine AS builder
 ARG HTTP_PROXY
@@ -22,8 +22,7 @@ ENV HTTP_PROXY=$HTTP_PROXY HTTPS_PROXY=$HTTPS_PROXY NO_PROXY=$NO_PROXY \
 ARG ALPINE_APK_REPO_HOST=dl-cdn.alpinelinux.org
 RUN sed -i "s/dl-cdn.alpinelinux.org/${ALPINE_APK_REPO_HOST}/g" /etc/apk/repositories && \
     apk add --no-cache gcc musl-dev
-COPY supervisord /src/supervisord
-COPY cloudphone-nodeagent-api /src/cloudphone-nodeagent-api
+COPY . /src/supervisord
 WORKDIR /src/supervisord
 
 ENV GOPROXY=https://goproxy.cn,direct
