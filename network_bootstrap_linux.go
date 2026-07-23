@@ -37,7 +37,7 @@ func cloudphoneNetworkBootstrapBeforeInit() {
 	gw6 := cloudphoneResolveGateway6()
 
 	if v4 == "" {
-		fmt.Fprintf(os.Stderr, "run_container: cloudphone network bootstrap: no IPv4 (POD_IP / eth0), skip metadata\n")
+		containerRunLogf("run_container: cloudphone network bootstrap: no IPv4 (POD_IP / eth0), skip metadata\n")
 		return
 	}
 	if prefix4 <= 0 {
@@ -66,7 +66,7 @@ func cloudphoneNetworkBootstrapBeforeInit() {
 		}
 	}
 	if err := os.WriteFile(cloudphoneNetworkPropPath, []byte(prop.String()), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: write %s: %v\n", cloudphoneNetworkPropPath, err)
+		containerRunLogf("run_container: write %s: %v\n", cloudphoneNetworkPropPath, err)
 	}
 
 	// Make POD_IPV6 visible to /init even when Kubernetes has no native POD_IPV6 field.
@@ -81,20 +81,20 @@ func cloudphoneNetworkBootstrapBeforeInit() {
 		gw4 = guessCiliumGatewayFromPodIP(v4)
 	}
 	if gw4 == "" {
-		fmt.Fprintf(os.Stderr, "run_container: skip %s (no IPv4 gateway)\n", cloudphoneEthernetIPFile)
+		containerRunLogf("run_container: skip %s (no IPv4 gateway)\n", cloudphoneEthernetIPFile)
 		return
 	}
 	ipc, err := buildJavaIpConfigStoreV3Eth0Static(v4, prefix4, gw4, dns)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: build ipconfig: %v\n", err)
+		containerRunLogf("run_container: build ipconfig: %v\n", err)
 		return
 	}
 	if err := os.MkdirAll(cloudphoneEthernetIPDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: mkdir %s: %v\n", cloudphoneEthernetIPDir, err)
+		containerRunLogf("run_container: mkdir %s: %v\n", cloudphoneEthernetIPDir, err)
 		return
 	}
 	if err := os.WriteFile(cloudphoneEthernetIPFile, ipc, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: write %s: %v\n", cloudphoneEthernetIPFile, err)
+		containerRunLogf("run_container: write %s: %v\n", cloudphoneEthernetIPFile, err)
 	}
 }
 

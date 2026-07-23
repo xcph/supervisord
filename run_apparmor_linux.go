@@ -84,39 +84,42 @@ func writeAppArmorExecAttr(profile string) error {
 
 // logAppArmorExecAttrFailure prints current-process details to stderr when attr/exec fails (triaging EACCES etc.).
 func logAppArmorExecAttrFailure(profile, payload, phase string, cause error) {
-	fmt.Fprintf(os.Stderr, "run_container: --- AppArmor /proc/self/attr/exec %s failed: %v\n", phase, cause)
-	fmt.Fprintf(os.Stderr, "run_container: target_profile=%q payload=%q\n", profile, strings.TrimSpace(payload))
-	fmt.Fprintf(os.Stderr, "run_container: pid=%d ppid=%d uid=%d gid=%d euid=%d egid=%d\n",
+	containerRunLogf("run_container: --- AppArmor /proc/self/attr/exec %s failed: %v\n", phase, cause)
+	containerRunLogf("run_container: target_profile=%q payload=%q\n", profile, strings.TrimSpace(payload))
+	containerRunLogf("run_container: pid=%d ppid=%d uid=%d gid=%d euid=%d egid=%d\n",
 		os.Getpid(), os.Getppid(), os.Getuid(), os.Getgid(), os.Geteuid(), os.Getegid())
 	if b, err := os.ReadFile("/proc/self/cmdline"); err == nil {
 		cmd := strings.TrimSpace(strings.ReplaceAll(string(b), "\x00", " "))
 		if len(cmd) > 2000 {
 			cmd = cmd[:2000] + "…"
 		}
-		fmt.Fprintf(os.Stderr, "run_container: cmdline: %s\n", cmd)
+		containerRunLogf("run_container: cmdline: %s\n", cmd)
 	} else {
-		fmt.Fprintf(os.Stderr, "run_container: cmdline: (read err %v)\n", err)
+		containerRunLogf("run_container: cmdline: (read err %v)\n", err)
 	}
 	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
-		fmt.Fprintf(os.Stderr, "run_container: /proc/self/attr/current: %q\n", strings.TrimSpace(string(b)))
+		containerRunLogf("run_container: /proc/self/attr/current: %q\n", strings.TrimSpace(string(b)))
 	} else {
-		fmt.Fprintf(os.Stderr, "run_container: /proc/self/attr/current: (read err %v)\n", err)
+		containerRunLogf("run_container: /proc/self/attr/current: (read err %v)\n", err)
 	}
-	logProcSelfStatusPick(os.Stderr)
+	logProcSelfStatusPick()
 	if b, err := os.ReadFile("/proc/self/cgroup"); err == nil {
 		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
 		if len(lines) > 12 {
 			lines = lines[:12]
 		}
-		fmt.Fprintf(os.Stderr, "run_container: /proc/self/cgroup (first lines):\n%s\n", strings.Join(lines, "\n"))
+		containerRunLogln("run_container: /proc/self/cgroup (first lines):")
+		for _, line := range lines {
+			containerRunLogf("run_container: cgroup %s\n", line)
+		}
 	}
 	if target, err := os.Readlink("/proc/self/ns/pid"); err == nil {
-		fmt.Fprintf(os.Stderr, "run_container: /proc/self/ns/pid -> %s\n", target)
+		containerRunLogf("run_container: /proc/self/ns/pid -> %s\n", target)
 	}
 	if target, err := os.Readlink("/proc/self/ns/user"); err == nil {
-		fmt.Fprintf(os.Stderr, "run_container: /proc/self/ns/user -> %s\n", target)
+		containerRunLogf("run_container: /proc/self/ns/user -> %s\n", target)
 	}
-	fmt.Fprintf(os.Stderr, "run_container: --- end AppArmor attr/exec diagnostics\n")
+	containerRunLogf("run_container: --- end AppArmor attr/exec diagnostics\n")
 }
 
 var procStatusPrefixes = []string{
@@ -125,10 +128,10 @@ var procStatusPrefixes = []string{
 	"CapInh:", "CapPrm:", "CapEff:", "CapBnd:", "CapAmb:",
 }
 
-func logProcSelfStatusPick(w *os.File) {
+func logProcSelfStatusPick() {
 	f, err := os.Open("/proc/self/status")
 	if err != nil {
-		fmt.Fprintf(w, "run_container: /proc/self/status: (open err %v)\n", err)
+		containerRunLogf("run_container: /proc/self/status: (open err %v)\n", err)
 		return
 	}
 	defer f.Close()
@@ -140,13 +143,13 @@ func logProcSelfStatusPick(w *os.File) {
 		line := sc.Text()
 		for _, pref := range procStatusPrefixes {
 			if strings.HasPrefix(line, pref) {
-				fmt.Fprintf(w, "run_container: status %s\n", line)
+				containerRunLogf("run_container: status %s\n", line)
 				break
 			}
 		}
 	}
 	if err := sc.Err(); err != nil {
-		fmt.Fprintf(w, "run_container: /proc/self/status: (scan err %v)\n", err)
+		containerRunLogf("run_container: /proc/self/status: (scan err %v)\n", err)
 	}
 }
 
@@ -159,7 +162,7 @@ func logProcSelfStatusPick(w *os.File) {
 func prepareAppArmorExecTransition(skipWhenPID1 bool) error {
 	prof := strings.TrimSpace(os.Getenv(envAppArmorProfile))
 	if prof == "" {
-		fmt.Fprintln(os.Stderr, "run_container: no apparmor profile requested (SUPERVISORD_APPARMOR_EXEC_PROFILE is empty)")
+		containerRunLogln("run_container: no apparmor profile requested (SUPERVISORD_APPARMOR_EXEC_PROFILE is empty)")
 		return nil
 	}
 	if skipWhenPID1 && os.Getpid() == 1 {
@@ -170,18 +173,18 @@ func prepareAppArmorExecTransition(skipWhenPID1 bool) error {
 		return nil
 	}
 	if !util.AppArmorExecTransitionAvailable() {
-		fmt.Fprintf(os.Stderr, "run_container: AppArmor exec transition unavailable; ignoring %s=%q (%s)\n", envAppArmorProfile, prof, appArmorExecUnavailableReason())
+		containerRunLogf("run_container: AppArmor exec transition unavailable; ignoring %s=%q (%s)\n", envAppArmorProfile, prof, appArmorExecUnavailableReason())
 		return nil
 	}
 	relaxed := isTruthyEnv(os.Getenv(envAppArmorRelaxed))
 	if err := writeAppArmorExecAttr(prof); err != nil {
 		if relaxed {
-			fmt.Fprintf(os.Stderr, "run_container: apparmor exec transition skipped (relaxed): %v\n", err)
+			containerRunLogf("run_container: apparmor exec transition skipped (relaxed): %v\n", err)
 			return nil
 		}
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "run_container: apparmor exec transition queued for profile %q\n", prof)
+	containerRunLogf("run_container: apparmor exec transition queued for profile %q\n", prof)
 	return nil
 }
 

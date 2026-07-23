@@ -33,9 +33,19 @@ func containerRunDebugEnabled() bool {
 	return v == "1" || v == "true" || v == "yes" || v == "on"
 }
 
+// containerRunLogf prefixes stderr lines with a local RFC3339 timestamp so
+// run_container diagnostics align with supervisord/logrus time=... logs.
+func containerRunLogf(format string, args ...interface{}) {
+	fmt.Fprintf(os.Stderr, "time=%q "+format, append([]interface{}{time.Now().Format(time.RFC3339)}, args...)...)
+}
+
+func containerRunLogln(msg string) {
+	containerRunLogf("%s\n", msg)
+}
+
 func containerRunDebugf(format string, args ...interface{}) {
 	if containerRunDebugEnabled() {
-		fmt.Fprintf(os.Stderr, "run_container: [debug] "+format+"\n", args...)
+		containerRunLogf("run_container: [debug] "+format+"\n", args...)
 	}
 }
 
@@ -69,7 +79,7 @@ func dropPrivilegesForFinalExecIfRequested() error {
 	if err := unix.Setuid(uid); err != nil {
 		return fmt.Errorf("setuid(%d): %w", uid, err)
 	}
-	fmt.Fprintf(os.Stderr, "run_container: final exec credentials switched to uid=%d gid=%d (wrapper started as uid=%d gid=%d)\n",
+	containerRunLogf("run_container: final exec credentials switched to uid=%d gid=%d (wrapper started as uid=%d gid=%d)\n",
 		uid, gid, origUID, origGID)
 	containerRunDebugf("dropped privileges for final exec to uid=%d gid=%d", uid, gid)
 	return nil
@@ -112,7 +122,7 @@ func isInitNamespaceTarget(target string) bool {
 // program can go to FATAL/EXITED and restart.
 // If the helper dies first, tear down the gate as well to avoid a lone orphan child.
 func runContainerChildReaperLoop(gatePid, helperPid int) {
-	fmt.Fprintln(os.Stderr, "run_container: pid=1 entering wait loop (gateway child + helper)")
+	containerRunLogln("run_container: pid=1 entering wait loop (gateway child + helper)")
 	for {
 		var ws syscall.WaitStatus
 		pid, err := syscall.Wait4(-1, &ws, 0, nil)
@@ -121,10 +131,10 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 				continue
 			}
 			if err == syscall.ECHILD {
-				fmt.Fprintln(os.Stderr, "run_container: reaper: no child processes remain")
+				containerRunLogln("run_container: reaper: no child processes remain")
 				os.Exit(0)
 			}
-			fmt.Fprintf(os.Stderr, "run_container: reaper wait4: %v\n", err)
+			containerRunLogf("run_container: reaper wait4: %v\n", err)
 			os.Exit(1)
 		}
 		containerRunDebugf("reaper: reaped pid=%d waitstatus=%v", pid, ws)
@@ -133,9 +143,9 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 			// Core path exited (exec failed, AppArmor, or the managed process exited) — end helper and this wrapper.
 			if helperPid > 0 {
 				if err := syscall.Kill(helperPid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-					fmt.Fprintf(os.Stderr, "run_container: reaper: kill helper pid=%d: %v\n", helperPid, err)
+					containerRunLogf("run_container: reaper: kill helper pid=%d: %v\n", helperPid, err)
 				} else {
-					fmt.Fprintf(os.Stderr, "run_container: reaper: gate ended; stopped helper pid=%d\n", helperPid)
+					containerRunLogf("run_container: reaper: gate ended; stopped helper pid=%d\n", helperPid)
 					containerRunDebugf("reaper: sent SIGTERM to helper pid=%d", helperPid)
 				}
 				_ = waitProcessExit(helperPid)
@@ -145,9 +155,9 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 		if pid == helperPid {
 			// Unexpected: helper died while gate still live — do not leave the gate running alone.
 			if err := syscall.Kill(gatePid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
-				fmt.Fprintf(os.Stderr, "run_container: reaper: helper died; kill gate pid=%d: %v\n", gatePid, err)
+				containerRunLogf("run_container: reaper: helper died; kill gate pid=%d: %v\n", gatePid, err)
 			} else {
-				fmt.Fprintln(os.Stderr, "run_container: reaper: helper died; stopped gate child")
+				containerRunLogln("run_container: reaper: helper died; stopped gate child")
 			}
 			_ = waitProcessExit(gatePid)
 			os.Exit(1)
@@ -197,17 +207,17 @@ func handleRunGateExec() bool {
 	}
 	argv := os.Args[2:]
 	if len(argv) < 1 {
-		fmt.Fprintln(os.Stderr, "run_container: gate: missing target")
+		containerRunLogln("run_container: gate: missing target")
 		os.Exit(1)
 	}
 	target := argv[0]
-	fmt.Fprintf(os.Stderr, "run_container: gate child starting pid=%d target=%q\n", os.Getpid(), target)
+	containerRunLogf("run_container: gate child starting pid=%d target=%q\n", os.Getpid(), target)
 	if err := prepareAppArmorExecTransition(false); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: gate apparmor: %v\n", err)
+		containerRunLogf("run_container: gate apparmor: %v\n", err)
 		os.Exit(1)
 	}
 	if err := dropPrivilegesForFinalExecIfRequested(); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: gate drop privileges: %v\n", err)
+		containerRunLogf("run_container: gate drop privileges: %v\n", err)
 		os.Exit(1)
 	}
 	if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
@@ -218,7 +228,7 @@ func handleRunGateExec() bool {
 	execEnv := filterSupervisordInternalEnv(os.Environ())
 	containerRunDebugf("gate exec target=%q argv=%q env_count=%d", target, argv, len(execEnv))
 	if err := unix.Exec(target, argv, execEnv); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: gate exec %s: %v\n", target, err)
+		containerRunLogf("run_container: gate exec %s: %v\n", target, err)
 		os.Exit(1)
 	}
 	return true
@@ -249,7 +259,7 @@ func handleRunContainer() bool {
 	}
 	target := os.Args[2]
 	argv := os.Args[2:]
-	fmt.Fprintf(os.Stderr, "run_container: wrapper starting with uid=%d gid=%d target=%q\n", os.Getuid(), os.Getgid(), target)
+	containerRunLogf("run_container: wrapper starting with uid=%d gid=%d target=%q\n", os.Getuid(), os.Getgid(), target)
 	containerRunDebugf("enter target=%q argv=%q uid=%d euid=%d gid=%d egid=%d ppid=%d",
 		target, argv, os.Getuid(), os.Geteuid(), os.Getgid(), os.Getegid(), os.Getppid())
 
@@ -262,7 +272,7 @@ func handleRunContainer() bool {
 		containerRunDebugf("umount /proc failed: %v", err)
 	}
 	if err := unix.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: mount /proc: %v\n", err)
+		containerRunLogf("run_container: mount /proc: %v\n", err)
 		os.Exit(1)
 	}
 	// 确保 /proc 可写，init 需写入 /proc/sys/vm/extra_free_kbytes 等
@@ -310,7 +320,7 @@ func handleRunContainer() bool {
 			Sys:   nil,
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: fork helper: %v\n", err)
+			containerRunLogf("run_container: fork helper: %v\n", err)
 			os.Exit(1)
 		}
 		containerRunDebugf("fork helper pid=%d", helperPid)
@@ -319,11 +329,11 @@ func handleRunContainer() bool {
 			os.Exit(0)
 		}
 		if err := prepareAppArmorExecTransition(true); err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: %v\n", err)
+			containerRunLogf("run_container: %v\n", err)
 			os.Exit(1)
 		}
 		if err := dropPrivilegesForFinalExecIfRequested(); err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: drop privileges before exec: %v\n", err)
+			containerRunLogf("run_container: drop privileges before exec: %v\n", err)
 			os.Exit(1)
 		}
 		if b, err := os.ReadFile("/proc/self/attr/current"); err == nil {
@@ -334,7 +344,7 @@ func handleRunContainer() bool {
 		execEnv := filterSupervisordInternalEnv(os.Environ())
 		containerRunDebugf("exec target=%q argv=%q env_count=%d", target, argv, len(execEnv))
 		if err := unix.Exec(target, argv, execEnv); err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: exec %s: %v\n", target, err)
+			containerRunLogf("run_container: exec %s: %v\n", target, err)
 			os.Exit(1)
 		}
 		return true
@@ -351,7 +361,7 @@ func handleRunContainer() bool {
 		Sys:   nil,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: fork gate child: %v\n", err)
+		containerRunLogf("run_container: fork gate child: %v\n", err)
 		os.Exit(1)
 	}
 	containerRunDebugf("fork gate child pid=%d (AppArmor + final exec delegated)", gatePid)
@@ -364,7 +374,7 @@ func handleRunContainer() bool {
 		Sys:   nil,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: fork helper: %v\n", err)
+		containerRunLogf("run_container: fork helper: %v\n", err)
 		os.Exit(1)
 	}
 	containerRunDebugf("fork helper pid=%d", helperPid)
@@ -373,7 +383,7 @@ func handleRunContainer() bool {
 		os.Exit(0)
 	}
 
-	fmt.Fprintf(os.Stderr, "run_container: pid=1 supervisor: gateway in child pid=%d helper pid=%d\n", gatePid, helperPid)
+	containerRunLogf("run_container: pid=1 supervisor: gateway in child pid=%d helper pid=%d\n", gatePid, helperPid)
 	runContainerChildReaperLoop(gatePid, helperPid)
 	return true
 }
@@ -413,7 +423,7 @@ func mountCpusetAfterInitDevReady() {
 	}
 	cpusetRoot := findCpusetRoot()
 	if cpusetRoot == "" {
-		fmt.Fprintf(os.Stderr, "run_container: mountCpuset: findCpusetRoot empty\n")
+		containerRunLogf("run_container: mountCpuset: findCpusetRoot empty\n")
 		return
 	}
 	_ = os.MkdirAll("/dev/cpuset", 0755)
@@ -425,9 +435,9 @@ func mountCpusetAfterInitDevReady() {
 	_ = os.MkdirAll(overlayBase, 0755)
 	_ = unix.Unmount(overlayBase, unix.MNT_DETACH)
 	if err := unix.Mount("tmpfs", overlayBase, "tmpfs", 0, "size=4M"); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: mount tmpfs for cpuset overlay: %v\n", err)
+		containerRunLogf("run_container: mount tmpfs for cpuset overlay: %v\n", err)
 		if err := unix.Mount(cpusetRoot, "/dev/cpuset", "", unix.MS_BIND, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: bind mount cpuset: %v\n", err)
+			containerRunLogf("run_container: bind mount cpuset: %v\n", err)
 			return
 		}
 	} else {
@@ -450,7 +460,7 @@ func mountCpusetAfterInitDevReady() {
 		if err := unix.Mount("overlay", "/dev/cpuset", "overlay", 0, opts); err != nil {
 			_ = unix.Unmount(overlayBase, unix.MNT_DETACH)
 			if err := unix.Mount(cpusetRoot, "/dev/cpuset", "", unix.MS_BIND, ""); err != nil {
-				fmt.Fprintf(os.Stderr, "run_container: mount cpuset: %v\n", err)
+				containerRunLogf("run_container: mount cpuset: %v\n", err)
 				return
 			}
 		}
@@ -496,7 +506,7 @@ func ensureCgroupRcForSurfaceflinger() {
 		buf.Write(path)
 	}
 	if err := os.WriteFile(cgroupRcPath, buf.Bytes(), 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: write cgroup.rc: %v\n", err)
+		containerRunLogf("run_container: write cgroup.rc: %v\n", err)
 	}
 }
 
@@ -522,7 +532,7 @@ func runProcfsSimulatorAfterInit() {
 		return
 	}
 	if !shouldWaitAndroidBootForHelper() {
-		fmt.Fprintf(os.Stderr, "run_container: skip procfs-simulator (non-Android helper target; set RUN_CONTAINER_ANDROID_BOOT_WAIT=1 to force)\n")
+		containerRunLogf("run_container: skip procfs-simulator (non-Android helper target; set RUN_CONTAINER_ANDROID_BOOT_WAIT=1 to force)\n")
 		return
 	}
 	const propPath = androidBootStatusPropPath
@@ -535,7 +545,7 @@ func runProcfsSimulatorAfterInit() {
 		}
 	}
 	if err := mountProcfs(); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: procfs: %v\n", err)
+		containerRunLogf("run_container: procfs: %v\n", err)
 	}
 }
 
@@ -619,17 +629,17 @@ func writeSystemResolvConf() {
 	)
 	data, err := os.ReadFile(src)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: read %s: %v\n", src, err)
+		containerRunLogf("run_container: read %s: %v\n", src, err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: mkdir %s: %v\n", filepath.Dir(dst), err)
+		containerRunLogf("run_container: mkdir %s: %v\n", filepath.Dir(dst), err)
 		return
 	}
 
 	// Write directly to destination because overlay/bind mounts may reject rename.
 	if err := os.WriteFile(dst, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: write %s: %v\n", dst, err)
+		containerRunLogf("run_container: write %s: %v\n", dst, err)
 		return
 	}
 }
@@ -638,7 +648,7 @@ func writeSystemResolvConf() {
 // and then writes /system/etc/resolv.conf.
 func writeSystemResolvConfAfterBootCompleted() {
 	if !shouldWaitAndroidBootForHelper() {
-		fmt.Fprintf(os.Stderr, "run_container: skip /system/etc/resolv.conf boot_completed wait (non-Android helper target; set RUN_CONTAINER_ANDROID_BOOT_WAIT=1 to force)\n")
+		containerRunLogf("run_container: skip /system/etc/resolv.conf boot_completed wait (non-Android helper target; set RUN_CONTAINER_ANDROID_BOOT_WAIT=1 to force)\n")
 		return
 	}
 	const propPath = androidBootStatusPropPath
@@ -651,7 +661,7 @@ func writeSystemResolvConfAfterBootCompleted() {
 			return
 		}
 	}
-	fmt.Fprintf(os.Stderr, "run_container: skip writing /system/etc/resolv.conf (boot_completed timeout)\n")
+	containerRunLogf("run_container: skip writing /system/etc/resolv.conf (boot_completed timeout)\n")
 }
 
 // mountSysfsWithSimulatedCpu overlays simulated CPU data from cpu-simulator onto /sys.
@@ -662,14 +672,14 @@ func mountSysfsWithSimulatedCpu() {
 	simCpu := filepath.Join(simRoot, "sys", "devices", "system", "cpu")
 	if _, err := os.Stat(simCpu); err == nil {
 		if err := unix.Mount(simCpu, "/sys/devices/system/cpu", "", unix.MS_BIND, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: bind mount cpu: %v\n", err)
+			containerRunLogf("run_container: bind mount cpu: %v\n", err)
 		}
 	}
 	// Overlay simulated thermal
 	simThermal := filepath.Join(simRoot, "sys", "class", "thermal")
 	if _, err := os.Stat(simThermal); err == nil {
 		if err := unix.Mount(simThermal, "/sys/class/thermal", "", unix.MS_BIND, ""); err != nil {
-			fmt.Fprintf(os.Stderr, "run_container: bind mount thermal: %v\n", err)
+			containerRunLogf("run_container: bind mount thermal: %v\n", err)
 		}
 	}
 }

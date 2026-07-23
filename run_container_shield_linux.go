@@ -4,7 +4,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -35,7 +34,7 @@ var runContainerDefaultTmpfsMaskDirs = []string{
 // /shared/supervisord/supervisord and fork+exec's the same path for the helper child.
 func maskPathsForRunContainerAndroid() {
 	if os.Getenv("CPH_RUN_CONTAINER_MASK_NODE_AGENT") == "0" || os.Getenv("CPH_RUN_CONTAINER_KEEP_NODE_AGENT") == "1" {
-		fmt.Fprintln(os.Stderr, "run_container: node-agent dir left visible (CPH_RUN_CONTAINER_MASK_NODE_AGENT=0 or CPH_RUN_CONTAINER_KEEP_NODE_AGENT=1)")
+		containerRunLogln("run_container: node-agent dir left visible (CPH_RUN_CONTAINER_MASK_NODE_AGENT=0 or CPH_RUN_CONTAINER_KEEP_NODE_AGENT=1)")
 	} else {
 		maskDirWithTmpfs("/var/lib/cloudphone-node-agent", "hide cloudphone-node-agent.sock from Android")
 	}
@@ -66,8 +65,8 @@ func maskDirWithTmpfs(path, reason string) {
 		return
 	}
 	if err := unix.Mount("tmpfs", path, "tmpfs", 0, "size=4m,mode=0755"); err != nil {
-		fmt.Fprintf(os.Stderr, "run_container: tmpfs mask %q (%s): %v\n", path, reason, err)
+		containerRunLogf("run_container: tmpfs mask %q (%s): %v\n", path, reason, err)
 		return
 	}
-	fmt.Fprintf(os.Stderr, "run_container: tmpfs masked %q (%s)\n", path, reason)
+	containerRunLogf("run_container: tmpfs masked %q (%s)\n", path, reason)
 }
