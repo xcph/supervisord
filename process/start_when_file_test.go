@@ -105,3 +105,33 @@ func TestWaitForStartFile_StopRequested(t *testing.T) {
 		t.Fatalf("expected stop sentinel, got %v", err)
 	}
 }
+
+func TestChangeStateTo_StoppedBeforeLaunch(t *testing.T) {
+	dir := t.TempDir()
+	e := writeProgramConf(t, dir, filepath.Join(dir, "absent"), 0)
+	p := NewProcess("s", e)
+	// Same path as "abort start: stopped while waiting for start_when_file":
+	// changeStateTo(Stopped) must not deref a nil cmd.Process (PID 1 panic).
+	p.changeStateTo(Stopped)
+	if p.GetState() != Stopped {
+		t.Fatalf("state=%v", p.GetState())
+	}
+}
+
+func TestStartStopDuringStartWhenFile_NoPanic(t *testing.T) {
+	dir := t.TempDir()
+	e := writeProgramConf(t, dir, filepath.Join(dir, "absent"), 0)
+	p := NewProcess("s", e)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Start(true)
+	}()
+	time.Sleep(150 * time.Millisecond)
+	p.Stop(true, false)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after Stop during start_when_file wait")
+	}
+}

@@ -780,6 +780,14 @@ func init() {
 		"get the standard output&standard error of the program",
 		"get the standard output&standard error of the program",
 		&logtailCommand)
+	ctlCmd.AddCommand("log",
+		"alias for logtail",
+		"alias for logtail <program>",
+		&logtailCommand)
+	ctlCmd.AddCommand("tail",
+		"alias for logtail",
+		"alias for logtail <program>",
+		&logtailCommand)
 	ctlCmd.AddCommand("get-env",
 		"get persisted runtime env (envFilesOverlay file)",
 		"GET /program/{name}/env — same as curl with --debug to print the request",

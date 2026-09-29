@@ -652,14 +652,46 @@ func (cl *CompositeLogger) SetPid(pid int) {
 	}
 }
 
-// ReadLog read log data from first logger in CompositeLogger pool
-func (cl *CompositeLogger) ReadLog(offset int64, length int64) (string, error) {
-	return cl.loggers[0].ReadLog(offset, length)
+func (cl *CompositeLogger) snapshotLoggers() []Logger {
+	cl.lock.Lock()
+	defer cl.lock.Unlock()
+	out := make([]Logger, len(cl.loggers))
+	copy(out, cl.loggers)
+	return out
 }
 
-// ReadTailLog tail the log data from first logger in CompositeLogger pool
+// ReadLog reads from the first logger that has a real file.
+// /dev/stdout StdLogger embeds NullLogger and returns NO_FILE; skip those so
+// `stdout_logfile=file,/dev/stdout` still works with ctl logtail.
+func (cl *CompositeLogger) ReadLog(offset int64, length int64) (string, error) {
+	var last error
+	for _, lg := range cl.snapshotLoggers() {
+		s, err := lg.ReadLog(offset, length)
+		if err == nil {
+			return s, nil
+		}
+		last = err
+	}
+	if last != nil {
+		return "", last
+	}
+	return "", faults.NewFault(faults.NoFile, "NO_FILE")
+}
+
+// ReadTailLog tails from the first logger that has a real file.
 func (cl *CompositeLogger) ReadTailLog(offset int64, length int64) (string, int64, bool, error) {
-	return cl.loggers[0].ReadTailLog(offset, length)
+	var last error
+	for _, lg := range cl.snapshotLoggers() {
+		s, n, overflow, err := lg.ReadTailLog(offset, length)
+		if err == nil {
+			return s, n, overflow, nil
+		}
+		last = err
+	}
+	if last != nil {
+		return "", 0, false, last
+	}
+	return "", 0, false, faults.NewFault(faults.NoFile, "NO_FILE")
 }
 
 // ClearCurLogFile clear the first logger file in CompositeLogger pool

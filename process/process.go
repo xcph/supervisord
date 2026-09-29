@@ -292,6 +292,14 @@ func (p *Process) GetPid() int {
 	if p.state == Stopped || p.state == Fatal || p.state == Unknown || p.state == Exited || p.state == Backoff {
 		return 0
 	}
+	return p.cmdPid()
+}
+
+// cmdPid returns the OS pid, or 0 if the program has not been launched.
+func (p *Process) cmdPid() int {
+	if p.cmd == nil || p.cmd.Process == nil {
+		return 0
+	}
 	return p.cmd.Process.Pid
 }
 
@@ -910,22 +918,23 @@ func (p *Process) changeStateTo(procState State) {
 		if procState == Starting {
 			events.EmitEvent(events.CreateProcessStartingEvent(progName, groupName, p.state.String(), int(atomic.LoadInt32(p.retryTimes))))
 		} else if procState == Running {
-			events.EmitEvent(events.CreateProcessRunningEvent(progName, groupName, p.state.String(), p.cmd.Process.Pid))
+			events.EmitEvent(events.CreateProcessRunningEvent(progName, groupName, p.state.String(), p.cmdPid()))
 		} else if procState == Backoff {
 			events.EmitEvent(events.CreateProcessBackoffEvent(progName, groupName, p.state.String(), int(atomic.LoadInt32(p.retryTimes))))
 		} else if procState == Stopping {
-			events.EmitEvent(events.CreateProcessStoppingEvent(progName, groupName, p.state.String(), p.cmd.Process.Pid))
+			events.EmitEvent(events.CreateProcessStoppingEvent(progName, groupName, p.state.String(), p.cmdPid()))
 		} else if procState == Exited {
 			exitCode, err := p.getExitCode()
 			expected := 0
 			if err == nil && p.inExitCodes(exitCode) {
 				expected = 1
 			}
-			events.EmitEvent(events.CreateProcessExitedEvent(progName, groupName, p.state.String(), expected, p.cmd.Process.Pid))
+			events.EmitEvent(events.CreateProcessExitedEvent(progName, groupName, p.state.String(), expected, p.cmdPid()))
 		} else if procState == Fatal {
 			events.EmitEvent(events.CreateProcessFatalEvent(progName, groupName, p.state.String()))
 		} else if procState == Stopped {
-			events.EmitEvent(events.CreateProcessStoppedEvent(progName, groupName, p.state.String(), p.cmd.Process.Pid))
+			// cmd/Process is nil when stop arrives before launch (start_when_file wait).
+			events.EmitEvent(events.CreateProcessStoppedEvent(progName, groupName, p.state.String(), p.cmdPid()))
 		} else if procState == Unknown {
 			events.EmitEvent(events.CreateProcessUnknownEvent(progName, groupName, p.state.String()))
 		}

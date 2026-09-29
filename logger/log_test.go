@@ -29,3 +29,20 @@ func TestSplitLogFile(t *testing.T) {
 	}
 
 }
+
+func TestCompositeLoggerReadLogSkipsStdout(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := dir + "/program.log"
+	cl := NewLogger("prog", path+", /dev/stdout", NewNullLocker(), 1024, 1, nil, NewNullLogEventEmitter())
+	if _, err := cl.Write([]byte("hello-logtail\n")); err != nil {
+		t.Fatal(err)
+	}
+	got, err := cl.ReadLog(0, 0)
+	if err != nil {
+		t.Fatalf("ReadLog: %v", err)
+	}
+	if got != "hello-logtail\n" {
+		t.Fatalf("ReadLog=%q", got)
+	}
+}

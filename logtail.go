@@ -61,34 +61,37 @@ func (lt *Logtail) getLog(logType string, w http.ResponseWriter, req *http.Reque
 	s, err := compositeLogger.ReadLog(0, 0)
 	if err != nil {
 		fmt.Println(err)
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(err.Error() + "\n"))
 		return
 	}
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(s)); err != nil {
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return
+	}
+	flusher.Flush()
 
-	w.Write([]byte(s))
-	//
-	//if ok {
-	//	w.Header().Set("Transfer-Encoding", "chunked")
-	//	w.WriteHeader(http.StatusOK)
-	//	flusher, _ := w.(http.Flusher)
-	//	ch := make(chan []byte, 100)
-	//	chanLogger := logger.NewChanLogger(ch)
-	//	compositeLogger.AddLogger(chanLogger)
-	//	for {
-	//		text, ok := <-ch
-	//		if !ok {
-	//			break
-	//		}
-	//		_, err := w.Write(text)
-	//		if err != nil {
-	//			break
-	//		}
-	//		flusher.Flush()
-	//	}
-	//	compositeLogger.RemoveLogger(chanLogger)
-	//	_ = chanLogger.Close()
-	//}
-
+	ch := make(chan []byte, 100)
+	chanLogger := logger.NewChanLogger(ch)
+	compositeLogger.AddLogger(chanLogger)
+	defer func() {
+		compositeLogger.RemoveLogger(chanLogger)
+		_ = chanLogger.Close()
+	}()
+	for {
+		text, more := <-ch
+		if !more {
+			return
+		}
+		if _, err := w.Write(text); err != nil {
+			return
+		}
+		flusher.Flush()
+	}
 }
