@@ -194,16 +194,17 @@ func main() {
 	if handleExecInNs() {
 		return
 	}
-	enableZombieReaper := false
+	// 默认回收僵尸。显式 SUPERVISORD_ENABLE_ZOMBIE_REAPER=0/false/no/off 才退回单等待者。
+	enableZombieReaper := true
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUPERVISORD_ENABLE_ZOMBIE_REAPER"))) {
-	case "1", "true", "yes", "on":
-		enableZombieReaper = true
+	case "0", "false", "no", "off":
+		enableZombieReaper = false
 	}
 	if enableZombieReaper {
 		ReapZombie()
-		fmt.Fprintln(os.Stderr, "[supervisord-startup] zombie reaper enabled (SUPERVISORD_ENABLE_ZOMBIE_REAPER=1)")
+		fmt.Fprintln(os.Stderr, "[supervisord-startup] zombie reaper enabled")
 	} else {
-		fmt.Fprintln(os.Stderr, "[supervisord-startup] zombie reaper disabled (single-waiter mode)")
+		fmt.Fprintln(os.Stderr, "[supervisord-startup] zombie reaper disabled (SUPERVISORD_ENABLE_ZOMBIE_REAPER=0, single-waiter mode)")
 	}
 
 	// when execute `supervisord` without sub-command, it should start the server
