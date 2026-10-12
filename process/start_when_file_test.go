@@ -58,6 +58,29 @@ func TestWaitForStartFile_OK(t *testing.T) {
 	}
 }
 
+func TestWaitForStartFile_EmptyMode(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent.json")
+	iniPath := filepath.Join(dir, "supervisord.conf")
+	content := `[program:testwf]
+command=/bin/true
+autostart=false
+start_when_file=` + missing + `
+start_when_file_missing=empty
+`
+	if err := os.WriteFile(iniPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	c := config.NewConfig(iniPath)
+	if _, err := c.Load(); err != nil {
+		t.Fatal(err)
+	}
+	p := NewProcess("s", c.GetProgram("testwf"))
+	if err := p.waitForStartFileIfConfigured(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestWaitForStartFile_Timeout(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "absent")

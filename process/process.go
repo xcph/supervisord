@@ -657,6 +657,20 @@ func (p *Process) waitForStartFileIfConfigured() error {
 		pollSecs = 1
 	}
 	poll := time.Duration(pollSecs) * time.Second
+	// empty/proceed：文件不存在时不阻塞，按空配置启动并打日志。默认 wait 保持原行为。
+	missingMode := strings.ToLower(strings.TrimSpace(p.config.GetString("start_when_file_missing", "wait")))
+	if missingMode == "empty" || missingMode == "proceed" {
+		fi, err := os.Stat(path)
+		if err != nil || fi.IsDir() {
+			log.WithFields(log.Fields{
+				"program":         p.GetName(),
+				"start_when_file": path,
+			}).Info("start_when_file missing, starting in empty config mode")
+			return nil
+		}
+		log.WithFields(log.Fields{"program": p.GetName(), "start_when_file": path}).Info("start_when_file present, proceeding with launch")
+		return nil
+	}
 
 	var deadline time.Time
 	if timeoutSecs > 0 {
