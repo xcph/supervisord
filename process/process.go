@@ -110,10 +110,15 @@ type Process struct {
 	// set when Stop(immediate=true) runs; Start() uses a shorter inStart drain window.
 	lastImmediateStop time.Time
 	retryTimes        *int32
-	lock       sync.RWMutex
-	stdin      io.WriteCloser
-	StdoutLog  logger.Logger
-	StderrLog  logger.Logger
+	lock              sync.RWMutex
+	stdin             io.WriteCloser
+	StdoutLog         logger.Logger
+	StderrLog         logger.Logger
+	// smolvmFallback is set after the virtual machine fails once in this start.
+	smolvmFallback       bool
+	smolvmFallbackReason string
+	launchedSmolvm       bool
+	relayStop            chan struct{}
 }
 
 // NewProcess creates new Process object
@@ -499,7 +504,7 @@ func (p *Process) createProgramCommand() error {
 	}
 	programPath := args[0]
 	cr := p.config.GetBool("container_run", false)
-	if cr {
+	if cr && !p.prepareSmolvm(&args) {
 		args = createContainerRunWrapper(args)
 	}
 	log.WithFields(log.Fields{
@@ -517,9 +522,13 @@ func (p *Process) createProgramCommand() error {
 	// 最终 exec 时无法降权到 user= 指定的非 root 用户。
 	p.setProgramRestartChangeMonitor(programPath)
 	setDeathsig(p.cmd.SysProcAttr)
-	setContainerRun(p.cmd.SysProcAttr, p.config)
+	if !p.launchedSmolvm {
+		setContainerRun(p.cmd.SysProcAttr, p.config)
+	}
 	p.setEnv()
-	if p.setUser() != nil {
+	if p.launchedSmolvm {
+		// smolvm opens /dev/kvm. The guest process drops its own user.
+	} else if p.setUser() != nil {
 		log.WithFields(log.Fields{"user": p.config.GetString("user", "")}).Error("fail to run as user")
 		return fmt.Errorf("fail to set user")
 	}
@@ -742,6 +751,8 @@ func (p *Process) run(finishCb func()) {
 	}
 
 	p.startTime = time.Now()
+	p.smolvmFallback = false
+	p.smolvmFallbackReason = ""
 	atomic.StoreInt32(p.retryTimes, 0)
 	startSecs := p.getStartSeconds()
 	restartPause := p.getRestartPause()
@@ -791,6 +802,10 @@ func (p *Process) run(finishCb func()) {
 		err = p.cmd.Start()
 
 		if err != nil {
+			if p.noteSmolvmStartFailure(err) {
+				p.changeStateTo(Backoff)
+				continue
+			}
 			if atomic.LoadInt32(p.retryTimes) >= p.getStartRetries() {
 				p.failToStartProgram(fmt.Sprintf("fail to start program with error:%v", err), finishCbWrapper)
 				break
@@ -878,6 +893,20 @@ func (p *Process) run(finishCb func()) {
 		}
 
 		p.lock.Lock()
+		p.stopADBRelay()
+		if p.launchedSmolvm && gatewayPauseRequested(p.gatewayStateDir()) {
+			p.stopByUser = true
+			p.launchedSmolvm = false
+			p.changeStateTo(Stopped)
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("openclaw-gateway paused; supervisord will not start it again until resume")
+			break
+		}
+		if p.launchedSmolvm && p.state != Running && p.state != Stopping && !p.smolvmFallback {
+			p.smolvmFallback = true
+			p.smolvmFallbackReason = "smolvm exited before the gateway was ready"
+			p.writeGatewayRuntime("smolvm", "namespace", p.smolvmFallbackReason)
+			p.launchedSmolvm = false
+		}
 
 		// we break the restartRetry loop if:
 		// 1. process still in running after startSecs (although it's exited right now)
