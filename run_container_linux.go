@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -121,8 +122,24 @@ func isInitNamespaceTarget(target string) bool {
 // long-running CNI/restore side tasks; stop it and exit this namespace so the outer supervisord
 // program can go to FATAL/EXITED and restart.
 // If the helper dies first, tear down the gate as well to avoid a lone orphan child.
+//
+// On SIGTERM/SIGINT/SIGQUIT (ctl stop / stopasgroup), broadcast SIGKILL to every other
+// process in this PID namespace before exiting so setsid'd Node workers cannot keep
+// renewing gateway.state.lock after supervisord flips to STOPPED.
 func runContainerChildReaperLoop(gatePid, helperPid int) {
 	containerRunLogln("run_container: pid=1 entering wait loop (gateway child + helper)")
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
+	go func() {
+		sig := <-sigCh
+		containerRunLogf("run_container: pid=1 got %v; killing all processes in this pid namespace\n", sig)
+		killAllInPidNamespace()
+		code := 143
+		if s, ok := sig.(syscall.Signal); ok {
+			code = 128 + int(s)
+		}
+		os.Exit(code)
+	}()
 	for {
 		var ws syscall.WaitStatus
 		pid, err := syscall.Wait4(-1, &ws, 0, nil)
@@ -150,6 +167,8 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 				}
 				_ = waitProcessExit(helperPid)
 			}
+			// Gate exited; any leftover workers (changed pgid) must not outlive this namespace.
+			killAllInPidNamespace()
 			os.Exit(exitStatusFromWaitStatus(ws))
 		}
 		if pid == helperPid {
@@ -160,8 +179,17 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 				containerRunLogln("run_container: reaper: helper died; stopped gate child")
 			}
 			_ = waitProcessExit(gatePid)
+			killAllInPidNamespace()
 			os.Exit(1)
 		}
+	}
+}
+
+// killAllInPidNamespace sends SIGKILL to every process in this PID namespace except
+// ourselves (PID 1). kill(2) pid=-1 from ns init is the portable teardown path.
+func killAllInPidNamespace() {
+	if err := syscall.Kill(-1, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+		containerRunLogf("run_container: kill(-1, SIGKILL): %v\n", err)
 	}
 }
 

@@ -211,21 +211,23 @@ func (r *XMLRPCClient) GetAllProcessInfo() (reply AllProcessInfoReply, err error
 	return
 }
 
-// ChangeProcessState requests to change given process state
+// ChangeProcessState requests to change given process state.
+// Always waits for start/stop to finish: ctl stop used to post only the
+// process name, so Wait stayed false and printed "stopped" before the child exited.
 func (r *XMLRPCClient) ChangeProcessState(change string, processName string) (reply StartStopReply, err error) {
 	if !(change == "start" || change == "stop") {
 		err = fmt.Errorf("Incorrect required state")
 		return
 	}
-
-	ins := struct{ Value string }{processName}
-	r.post(fmt.Sprintf("supervisor.%sProcess", change), &ins, func(body io.ReadCloser, procError error) {
-		err = procError
-		if err == nil {
-			err = xml.DecodeClientResponse(body, &reply)
-		}
-	})
-
+	if change == "start" {
+		var br types.BooleanReply
+		br, err = r.StartProcess(processName, true)
+		reply.Value = br.Success
+		return
+	}
+	var br types.BooleanReply
+	br, err = r.StopProcess(processName, true, false)
+	reply.Value = br.Success
 	return
 }
 

@@ -1366,6 +1366,7 @@ func filterRootEnv(env *[]string) {
 // Stop sends signal to process to make it quit.
 // If immediate is true, sends SIGKILL immediately (same effect as kill -9 for the supervised process tree when killasgroup applies).
 // If wait is false, returns once the kill path has been launched without waiting for the process to exit.
+// If wait is true, blocks until the supervised child is no longer running (or a hard deadline elapses).
 func (p *Process) Stop(wait bool, immediate bool) {
 	p.lock.Lock()
 	p.stopByUser = true
@@ -1384,6 +1385,19 @@ func (p *Process) Stop(wait bool, immediate bool) {
 		log.WithFields(log.Fields{"program": p.GetName()}).Error("Cannot set stopasgroup=true and killasgroup=false")
 	}
 
+	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
+	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second
+	killwaitsecs := time.Duration(p.config.GetInt("killwaitsecs", 2)) * time.Second
+	// Hard ceiling so Wait=true callers (ctl stop) do not return while the child is still alive.
+	sigRounds := len(sigs)
+	if sigRounds == 0 {
+		sigRounds = 1
+	}
+	exitDeadline := time.Now().Add(waitsecs*time.Duration(sigRounds) + killwaitsecs + 5*time.Second)
+	if immediate {
+		exitDeadline = time.Now().Add(killwaitsecs + 5*time.Second)
+	}
+
 	var stopped int32 = 0
 	if immediate {
 		p.lock.Lock()
@@ -1397,57 +1411,54 @@ func (p *Process) Stop(wait bool, immediate bool) {
 			}
 			atomic.StoreInt32(&stopped, 1)
 		}()
-		if wait {
-			for atomic.LoadInt32(&stopped) == 0 {
-				time.Sleep(10 * time.Millisecond)
+	} else {
+		go func() {
+			for i := 0; i < len(sigs) && atomic.LoadInt32(&stopped) == 0; i++ {
+				// send signal to process
+				sig, err := signals.ToSignal(sigs[i])
+				if err != nil {
+					continue
+				}
+				log.WithFields(log.Fields{"program": p.GetName(), "signal": sigs[i]}).Info("send stop signal to program")
+				p.Signal(sig, stopasgroup)
+				endTime := time.Now().Add(waitsecs)
+				// wait at most "stopwaitsecs" seconds for one signal
+				for endTime.After(time.Now()) {
+					// if it already exits
+					if p.state != Starting && p.state != Running && p.state != Stopping {
+						atomic.StoreInt32(&stopped, 1)
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
 			}
-		}
+			if atomic.LoadInt32(&stopped) == 0 {
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("force to kill the program")
+				p.Signal(syscall.SIGKILL, killasgroup)
+				killEndTime := time.Now().Add(killwaitsecs)
+				for killEndTime.After(time.Now()) {
+					// if it exits
+					if p.state != Starting && p.state != Running && p.state != Stopping {
+						atomic.StoreInt32(&stopped, 1)
+						break
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				atomic.StoreInt32(&stopped, 1)
+			}
+		}()
+	}
+	if !wait {
 		return
 	}
-
-	sigs := strings.Fields(p.config.GetString("stopsignal", "TERM"))
-	waitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)) * time.Second
-	killwaitsecs := time.Duration(p.config.GetInt("killwaitsecs", 2)) * time.Second
-
-	go func() {
-		for i := 0; i < len(sigs) && atomic.LoadInt32(&stopped) == 0; i++ {
-			// send signal to process
-			sig, err := signals.ToSignal(sigs[i])
-			if err != nil {
-				continue
-			}
-			log.WithFields(log.Fields{"program": p.GetName(), "signal": sigs[i]}).Info("send stop signal to program")
-			p.Signal(sig, stopasgroup)
-			endTime := time.Now().Add(waitsecs)
-			// wait at most "stopwaitsecs" seconds for one signal
-			for endTime.After(time.Now()) {
-				// if it already exits
-				if p.state != Starting && p.state != Running && p.state != Stopping {
-					atomic.StoreInt32(&stopped, 1)
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-		if atomic.LoadInt32(&stopped) == 0 {
-			log.WithFields(log.Fields{"program": p.GetName()}).Info("force to kill the program")
-			p.Signal(syscall.SIGKILL, killasgroup)
-			killEndTime := time.Now().Add(killwaitsecs)
-			for killEndTime.After(time.Now()) {
-				// if it exits
-				if p.state != Starting && p.state != Running && p.state != Stopping {
-					atomic.StoreInt32(&stopped, 1)
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-			atomic.StoreInt32(&stopped, 1)
-		}
-	}()
-	if wait {
-		for atomic.LoadInt32(&stopped) == 0 {
-			time.Sleep(1 * time.Second)
-		}
+	for atomic.LoadInt32(&stopped) == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	for p.isRunning() && time.Now().Before(exitDeadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if p.isRunning() {
+		log.WithFields(log.Fields{"program": p.GetName()}).Warn("stop wait deadline elapsed; supervised child still running")
 	}
 }
 
