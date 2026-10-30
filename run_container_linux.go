@@ -14,11 +14,36 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/ochinchina/supervisord/process"
 	"golang.org/x/sys/unix"
 )
+
+// How long PID 1 waits for a specific child after SIGTERM before escalating to SIGKILL.
+const runContainerWaitChildTimeout = 10 * time.Second
+const runContainerWaitAfterKill = 2 * time.Second
+
+// containerExitOnce ensures the signal handler and the reaper agree on a single os.Exit.
+var containerExitOnce sync.Once
+
+// preferredContainerExit is set by the stop-signal handler (128+sig) before killAll.
+// If the reaper races and reaches containerExit first with a child SIGKILL code (137),
+// we still prefer the stop signal so ctl stop reports a stable 143 (or 130/131).
+var preferredContainerExit atomic.Int32
+
+func containerExit(code int) {
+	containerExitOnce.Do(func() {
+		if pref := preferredContainerExit.Load(); pref != 0 {
+			code = int(pref)
+		}
+		os.Exit(code)
+	})
+	select {} // unreachable unless os.Exit is stubbed in tests
+}
 
 var procfsSimulatorPaths = []string{"/shared/supervisord/procfs-simulator", "/usr/local/bin/procfs-simulator"}
 
@@ -94,7 +119,7 @@ const cniBootstrapDir = "/shared/cni-bootstrap"
 const androidBootStatusPropPath = "/dev/__properties__/u:object_r:boot_status_prop:s0"
 
 // shouldWaitAndroidBootForHelper decides whether the __run_helper__ path should poll boot_completed.
-// OpenClaw gateway-only images use container_run with a shell/node target (not /init): waiting 5m on a
+// Non-Android images often use container_run with a shell/node target (not /init): waiting 5m on a
 // missing property file only burns time. Android/redroid pods pass target /init or /sbin/init.
 //
 // RUN_CONTAINER_ANDROID_BOOT_WAIT: "1"/"true" force wait; "0"/"false" force skip; unset = auto from target.
@@ -124,21 +149,24 @@ func isInitNamespaceTarget(target string) bool {
 // If the helper dies first, tear down the gate as well to avoid a lone orphan child.
 //
 // On SIGTERM/SIGINT/SIGQUIT (ctl stop / stopasgroup), broadcast SIGKILL to every other
-// process in this PID namespace before exiting so setsid'd Node workers cannot keep
-// renewing gateway.state.lock after supervisord flips to STOPPED.
+// process in this PID namespace before exiting so setsid'd workers cannot keep
+// holding locks after supervisord flips to STOPPED.
 func runContainerChildReaperLoop(gatePid, helperPid int) {
-	containerRunLogln("run_container: pid=1 entering wait loop (gateway child + helper)")
+	containerRunLogln("run_container: pid=1 entering wait loop (gate child + helper)")
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGQUIT)
 	go func() {
 		sig := <-sigCh
-		containerRunLogf("run_container: pid=1 got %v; killing all processes in this pid namespace\n", sig)
-		killAllInPidNamespace()
 		code := 143
 		if s, ok := sig.(syscall.Signal); ok {
 			code = 128 + int(s)
 		}
-		os.Exit(code)
+		// Publish preferred code before killAll so a racing reaper that reaps
+		// SIGKILL'd children still reports the stop signal, not 137.
+		preferredContainerExit.Store(int32(code))
+		containerRunLogf("run_container: pid=1 got %v; killing all processes in this pid namespace (prefer report_exit=%d)\n", sig, code)
+		killAllInPidNamespace()
+		containerExit(code)
 	}()
 	for {
 		var ws syscall.WaitStatus
@@ -148,16 +176,18 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 				continue
 			}
 			if err == syscall.ECHILD {
-				containerRunLogln("run_container: reaper: no child processes remain")
-				os.Exit(0)
+				// Unexpected empty child table — do not report success (would look like exit 0).
+				containerRunLogln("run_container: reaper: no child processes remain (ECHILD); report_exit=1")
+				containerExit(1)
 			}
 			containerRunLogf("run_container: reaper wait4: %v\n", err)
-			os.Exit(1)
+			containerExit(1)
 		}
 		containerRunDebugf("reaper: reaped pid=%d waitstatus=%v", pid, ws)
 
 		if pid == gatePid {
 			// Core path exited (exec failed, AppArmor, or the managed process exited) — end helper and this wrapper.
+			code := process.ReportExitCode(ws)
 			if helperPid > 0 {
 				if err := syscall.Kill(helperPid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 					containerRunLogf("run_container: reaper: kill helper pid=%d: %v\n", helperPid, err)
@@ -165,23 +195,42 @@ func runContainerChildReaperLoop(gatePid, helperPid int) {
 					containerRunLogf("run_container: reaper: gate ended; stopped helper pid=%d\n", helperPid)
 					containerRunDebugf("reaper: sent SIGTERM to helper pid=%d", helperPid)
 				}
-				_ = waitProcessExit(helperPid)
+				if _, err := waitProcessExit(helperPid, runContainerWaitChildTimeout); err != nil {
+					containerRunLogf("run_container: reaper: wait helper pid=%d: %v\n", helperPid, err)
+				}
 			}
 			// Gate exited; any leftover workers (changed pgid) must not outlive this namespace.
 			killAllInPidNamespace()
-			os.Exit(exitStatusFromWaitStatus(ws))
+			if ws.Signaled() {
+				containerRunLogf("run_container: reaper: gate signaled=%v report_exit=%d\n", ws.Signal(), code)
+			} else {
+				containerRunLogf("run_container: reaper: gate exited report_exit=%d\n", code)
+			}
+			containerExit(code)
 		}
 		if pid == helperPid {
-			// Unexpected: helper died while gate still live — do not leave the gate running alone.
+			// Unexpected: helper died while gate still live — tear down gate and report *gate* status.
+			containerRunLogf("run_container: reaper: helper died first helper_report_exit=%d waitstatus=%v; stopping gate pid=%d\n",
+				process.ReportExitCode(ws), ws, gatePid)
 			if err := syscall.Kill(gatePid, syscall.SIGTERM); err != nil && err != syscall.ESRCH {
 				containerRunLogf("run_container: reaper: helper died; kill gate pid=%d: %v\n", gatePid, err)
-			} else {
-				containerRunLogln("run_container: reaper: helper died; stopped gate child")
 			}
-			_ = waitProcessExit(gatePid)
+			gateWS, err := waitProcessExit(gatePid, runContainerWaitChildTimeout)
 			killAllInPidNamespace()
-			os.Exit(1)
+			if err != nil {
+				containerRunLogf("run_container: reaper: wait gate after helper death: %v; report_exit=1\n", err)
+				containerExit(1)
+			}
+			code := process.ReportExitCode(gateWS)
+			if gateWS.Signaled() {
+				containerRunLogf("run_container: reaper: gate after helper death signaled=%v report_exit=%d\n", gateWS.Signal(), code)
+			} else {
+				containerRunLogf("run_container: reaper: gate after helper death report_exit=%d\n", code)
+			}
+			containerExit(code)
 		}
+		// Other reaped PIDs are setsid workers / grandchildren — keep waiting for gate/helper.
+		containerRunDebugf("reaper: ignored non-gate/helper pid=%d report_exit=%d", pid, process.ReportExitCode(ws))
 	}
 }
 
@@ -193,33 +242,42 @@ func killAllInPidNamespace() {
 	}
 }
 
-func waitProcessExit(p int) syscall.WaitStatus {
+// waitProcessExit waits for pid p. After timeout it sends SIGKILL and waits a
+// short grace period. Uses WNOHANG so this never races a concurrent Wait4(-1)
+// in the same goroutine (the reaper loop is blocked here).
+func waitProcessExit(p int, timeout time.Duration) (syscall.WaitStatus, error) {
+	if timeout <= 0 {
+		timeout = runContainerWaitChildTimeout
+	}
+	deadline := time.Now().Add(timeout)
+	sentKill := false
 	for {
 		var w syscall.WaitStatus
-		_, err := syscall.Wait4(p, &w, 0, nil)
+		pid, err := syscall.Wait4(p, &w, syscall.WNOHANG, nil)
 		if err == syscall.EINTR {
 			continue
 		}
 		if err != nil {
-			return 0
+			return 0, err
 		}
-		return w
-	}
-}
-
-func exitStatusFromWaitStatus(ws syscall.WaitStatus) int {
-	if ws.Signaled() {
-		// 128+signal is a common shell convention; cap at 255.
-		c := 128 + int(ws.Signal())
-		if c > 255 {
-			return 255
+		if pid == p {
+			return w, nil
 		}
-		return c
+		now := time.Now()
+		if !sentKill && !now.Before(deadline) {
+			if err := syscall.Kill(p, syscall.SIGKILL); err != nil && err != syscall.ESRCH {
+				return 0, fmt.Errorf("wait pid %d: SIGKILL: %w", p, err)
+			}
+			containerRunLogf("run_container: wait pid=%d timed out after %s; sent SIGKILL\n", p, timeout)
+			sentKill = true
+			deadline = time.Now().Add(runContainerWaitAfterKill)
+			continue
+		}
+		if sentKill && !now.Before(deadline) {
+			return 0, fmt.Errorf("wait pid %d: timed out after SIGKILL", p)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	if ws.Exited() {
-		return ws.ExitStatus()
-	}
-	return 1
 }
 
 // handleRunGateExec runs when invoked as:
@@ -228,7 +286,7 @@ func exitStatusFromWaitStatus(ws syscall.WaitStatus) int {
 //
 // It exists so AppArmor "exec profile" can be applied from a task that is not PID 1 in the
 // container_run PID namespace (gorilla/kernel reject or skip attr/exec on pid 1), then exec
-// the real program (e.g. openclaw-gateway-exec.sh).
+// the real program (configured command / wrapper script).
 func handleRunGateExec() bool {
 	if len(os.Args) < 3 || os.Args[1] != runGateExecMagic {
 		return false
@@ -352,10 +410,6 @@ func handleRunContainer() bool {
 			os.Exit(1)
 		}
 		containerRunDebugf("fork helper pid=%d", helperPid)
-		if helperPid == 0 {
-			runHelperDelayedTasks()
-			os.Exit(0)
-		}
 		if err := prepareAppArmorExecTransition(true); err != nil {
 			containerRunLogf("run_container: %v\n", err)
 			os.Exit(1)
@@ -406,12 +460,8 @@ func handleRunContainer() bool {
 		os.Exit(1)
 	}
 	containerRunDebugf("fork helper pid=%d", helperPid)
-	if helperPid == 0 {
-		runHelperDelayedTasks()
-		os.Exit(0)
-	}
 
-	containerRunLogf("run_container: pid=1 supervisor: gateway in child pid=%d helper pid=%d\n", gatePid, helperPid)
+	containerRunLogf("run_container: pid=1 supervisor: gate child pid=%d helper pid=%d\n", gatePid, helperPid)
 	runContainerChildReaperLoop(gatePid, helperPid)
 	return true
 }

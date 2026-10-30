@@ -558,6 +558,9 @@ type ProcessStateEvent struct {
 	tries       int
 	expected    int
 	pid         int
+	// exitStatus is the shell-style report code; includeExitStatus gates GetBody.
+	exitStatus        int
+	includeExitStatus bool
 }
 
 // CreateProcessStartingEvent emits create process starting event
@@ -624,34 +627,44 @@ func CreateProcessStoppingEvent(process string,
 	return r
 }
 
-// CreateProcessExitedEvent emits create process exited event
+// CreateProcessExitedEvent emits create process exited event.
+// When hasExit is true, exitStatus (shell-style report code, 128+sig when signaled) is in the body.
 func CreateProcessExitedEvent(process string,
 	group string,
 	fromState string,
 	expected int,
-	pid int) *ProcessStateEvent {
+	pid int,
+	exitStatus int,
+	hasExit bool) *ProcessStateEvent {
 	r := &ProcessStateEvent{processName: process,
-		groupName: group,
-		fromState: fromState,
-		tries:     -1,
-		expected:  expected,
-		pid:       pid}
+		groupName:         group,
+		fromState:         fromState,
+		tries:             -1,
+		expected:          expected,
+		pid:               pid,
+		exitStatus:        exitStatus,
+		includeExitStatus: hasExit}
 	r.eventType = "PROCESS_STATE_EXITED"
 	r.serial = nextEventSerial()
 	return r
 }
 
-// CreateProcessStoppedEvent emits create process stopped event
+// CreateProcessStoppedEvent emits create process stopped event.
+// When hasExit is true, exitStatus is included in the event body.
 func CreateProcessStoppedEvent(process string,
 	group string,
 	fromState string,
-	pid int) *ProcessStateEvent {
+	pid int,
+	exitStatus int,
+	hasExit bool) *ProcessStateEvent {
 	r := &ProcessStateEvent{processName: process,
-		groupName: group,
-		fromState: fromState,
-		tries:     -1,
-		expected:  -1,
-		pid:       pid}
+		groupName:         group,
+		fromState:         fromState,
+		tries:             -1,
+		expected:          -1,
+		pid:               pid,
+		exitStatus:        exitStatus,
+		includeExitStatus: hasExit}
 	r.eventType = "PROCESS_STATE_STOPPED"
 	r.serial = nextEventSerial()
 	return r
@@ -700,6 +713,9 @@ func (pse *ProcessStateEvent) GetBody() string {
 
 	if pse.pid != 0 {
 		body = fmt.Sprintf("%s pid:%d", body, pse.pid)
+	}
+	if pse.includeExitStatus {
+		body = fmt.Sprintf("%s exitstatus:%d", body, pse.exitStatus)
 	}
 	return body
 }

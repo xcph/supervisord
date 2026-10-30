@@ -9,56 +9,137 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ochinchina/supervisord/config"
 	"github.com/ochinchina/supervisord/process"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	openClawInitRuntimeConfigPath = "/tmp/openclaw-init.runtime.json"
-	cooperativeShutdownTimeout    = 5 * time.Second
-	cooperativeStopWaitTimeout    = 20 * time.Second
+	defaultStopHTTPTimeoutSecs = 5
+	defaultStopHTTPWaitSecs    = 20
+	defaultStopHTTPPath        = "/v1/shutdown"
 )
 
-type openClawInitRuntimeConfig struct {
+// stopHTTPRuntimeJSON is an optional discovery file for admin listen/token.
+// Shape is product-agnostic: {"admin":{"listen":"host:port","token":"..."}}.
+type stopHTTPRuntimeJSON struct {
 	Admin struct {
 		Listen string `json:"listen"`
 		Token  string `json:"token"`
 	} `json:"admin"`
 }
 
-func resolveOpenClawInitAdminToken(envVars map[string]string) string {
-	if t := strings.TrimSpace(envVars["OPENCLAW_INIT_ADMIN_TOKEN"]); t != "" && !strings.Contains(t, "__REPLACE") {
-		return t
-	}
-	if t := strings.TrimSpace(os.Getenv("OPENCLAW_INIT_ADMIN_TOKEN")); t != "" && !strings.Contains(t, "__REPLACE") {
-		return t
-	}
-	cfg, err := readOpenClawInitRuntimeConfig()
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(cfg.Admin.Token)
+type stopHTTPSpec struct {
+	url        string
+	token      string
+	timeout    time.Duration
+	wait       time.Duration
+	enabled    bool
 }
 
-func resolveOpenClawInitAdminBaseURL(envVars map[string]string) string {
-	if u := strings.TrimSpace(envVars["OPENCLAW_INIT_ADMIN_URL"]); u != "" {
-		return strings.TrimSuffix(u, "/")
+func (sr *SupervisorRestful) resolveStopHTTPSpec(name string, envVars map[string]string) stopHTTPSpec {
+	spec := stopHTTPSpec{
+		timeout: time.Duration(defaultStopHTTPTimeoutSecs) * time.Second,
+		wait:    time.Duration(defaultStopHTTPWaitSecs) * time.Second,
 	}
-	if u := strings.TrimSpace(os.Getenv("OPENCLAW_INIT_ADMIN_URL")); u != "" {
-		return strings.TrimSuffix(u, "/")
+	proc := sr.supervisor.procMgr.Find(name)
+	var entry *config.Entry
+	if proc != nil {
+		entry = proc.GetConfig()
 	}
-	cfg, err := readOpenClawInitRuntimeConfig()
-	if err == nil {
-		if u := adminListenToBaseURL(cfg.Admin.Listen); u != "" {
-			return u
+	if entry == nil {
+		return spec
+	}
+
+	timeoutSecs := entry.GetInt("stop_http_timeout_secs", defaultStopHTTPTimeoutSecs)
+	if timeoutSecs > 0 {
+		spec.timeout = time.Duration(timeoutSecs) * time.Second
+	}
+	waitSecs := entry.GetInt("stop_http_wait_secs", defaultStopHTTPWaitSecs)
+	if waitSecs > 0 {
+		spec.wait = time.Duration(waitSecs) * time.Second
+	}
+
+	url := strings.TrimSpace(entry.GetString("stop_http_url", ""))
+	path := strings.TrimSpace(entry.GetString("stop_http_path", defaultStopHTTPPath))
+	if path == "" {
+		path = defaultStopHTTPPath
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	runtimePath := strings.TrimSpace(entry.GetString("stop_http_runtime_json", ""))
+	var runtime stopHTTPRuntimeJSON
+	hasRuntime := false
+	if runtimePath != "" {
+		if cfg, err := readStopHTTPRuntimeJSON(runtimePath); err == nil {
+			runtime = cfg
+			hasRuntime = true
 		}
 	}
-	return "http://127.0.0.1:18890"
+
+	if url == "" && hasRuntime {
+		if base := adminListenToBaseURL(runtime.Admin.Listen); base != "" {
+			url = base + path
+		}
+	}
+	if url == "" {
+		return spec
+	}
+	spec.url = url
+	spec.enabled = true
+
+	token := strings.TrimSpace(entry.GetString("stop_http_token", ""))
+	tokenEnv := strings.TrimSpace(entry.GetString("stop_http_token_env", ""))
+	if token == "" || strings.Contains(token, "__REPLACE") {
+		token = ""
+	}
+	if token == "" && tokenEnv != "" {
+		token = lookupStopHTTPToken(entry, envVars, tokenEnv)
+	}
+	if (token == "" || strings.Contains(token, "__REPLACE")) && hasRuntime {
+		if t := strings.TrimSpace(runtime.Admin.Token); t != "" && !strings.Contains(t, "__REPLACE") {
+			token = t
+		}
+	}
+	if strings.Contains(token, "__REPLACE") {
+		token = ""
+	}
+	spec.token = token
+	return spec
 }
 
-func readOpenClawInitRuntimeConfig() (openClawInitRuntimeConfig, error) {
-	var cfg openClawInitRuntimeConfig
-	raw, err := os.ReadFile(openClawInitRuntimeConfigPath)
+func lookupEnvMapOrOS(envVars map[string]string, key string) string {
+	if envVars != nil {
+		if v := strings.TrimSpace(envVars[key]); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(os.Getenv(key))
+}
+
+func lookupStopHTTPToken(entry *config.Entry, envVars map[string]string, tokenEnv string) string {
+	if t := lookupEnvMapOrOS(envVars, tokenEnv); t != "" {
+		return t
+	}
+	prefix := tokenEnv + "="
+	for _, item := range entry.GetEnvFromFiles("envFilesOverlay") {
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimSpace(item[len(prefix):])
+		}
+	}
+	for _, item := range entry.GetEnv("environment") {
+		if strings.HasPrefix(item, prefix) {
+			return strings.TrimSpace(item[len(prefix):])
+		}
+	}
+	return ""
+}
+
+func readStopHTTPRuntimeJSON(path string) (stopHTTPRuntimeJSON, error) {
+	var cfg stopHTTPRuntimeJSON
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return cfg, err
 	}
@@ -83,20 +164,21 @@ func adminListenToBaseURL(listen string) string {
 	return fmt.Sprintf("http://%s:%s", host, port)
 }
 
-// requestOpenClawInitCooperativeShutdown asks openclaw-init to exit via its admin API (self SIGTERM).
-// Works when supervisord lacks CAP_KILL to signal user=node children (cap_drop ALL without CAP_KILL).
-func requestOpenClawInitCooperativeShutdown(envVars map[string]string) error {
-	token := resolveOpenClawInitAdminToken(envVars)
-	if token == "" {
-		return fmt.Errorf("openclaw-init admin token unavailable")
+// requestCooperativeHTTPShutdown asks the program to exit via a configured HTTP endpoint
+// (useful when supervisord lacks CAP_KILL to signal dropped-privilege children).
+func requestCooperativeHTTPShutdown(spec stopHTTPSpec) error {
+	if !spec.enabled || spec.url == "" {
+		return fmt.Errorf("stop_http_url not configured")
 	}
-	base := resolveOpenClawInitAdminBaseURL(envVars)
-	req, err := http.NewRequest(http.MethodPost, base+"/v1/shutdown", nil)
+	if spec.token == "" {
+		return fmt.Errorf("stop_http token unavailable")
+	}
+	req, err := http.NewRequest(http.MethodPost, spec.url, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	client := &http.Client{Timeout: cooperativeShutdownTimeout}
+	req.Header.Set("Authorization", "Bearer "+spec.token)
+	client := &http.Client{Timeout: spec.timeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
@@ -104,9 +186,9 @@ func requestOpenClawInitCooperativeShutdown(envVars map[string]string) error {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("admin shutdown HTTP %d", resp.StatusCode)
+		return fmt.Errorf("stop_http HTTP %d", resp.StatusCode)
 	}
-	log.WithFields(log.Fields{"admin_base": base}).Info("openclaw-init cooperative shutdown requested")
+	log.WithFields(log.Fields{"url": spec.url}).Info("cooperative HTTP shutdown requested")
 	return nil
 }
 
@@ -128,13 +210,16 @@ func (sr *SupervisorRestful) waitProgramStopped(name string, timeout time.Durati
 }
 
 func (sr *SupervisorRestful) stopProgramForRestart(name string, immediate bool, envVars map[string]string) error {
-	if immediate && name == "openclaw-init" {
-		if err := requestOpenClawInitCooperativeShutdown(envVars); err != nil {
-			log.WithError(err).Warn("openclaw-init cooperative shutdown failed; falling back to supervisord stop")
-		} else if sr.waitProgramStopped(name, cooperativeStopWaitTimeout) {
-			return nil
-		} else {
-			log.Warn("openclaw-init cooperative shutdown timed out; falling back to supervisord stop")
+	if immediate {
+		spec := sr.resolveStopHTTPSpec(name, envVars)
+		if spec.enabled {
+			if err := requestCooperativeHTTPShutdown(spec); err != nil {
+				log.WithError(err).WithField("program", name).Warn("cooperative HTTP shutdown failed; falling back to supervisord stop")
+			} else if sr.waitProgramStopped(name, spec.wait) {
+				return nil
+			} else {
+				log.WithField("program", name).Warn("cooperative HTTP shutdown timed out; falling back to supervisord stop")
+			}
 		}
 	}
 	_, err := sr._stopProgram(name, immediate)

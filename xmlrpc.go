@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/gorilla/rpc"
@@ -122,17 +121,6 @@ func getProgramConfigPath(programName string, s *Supervisor) string {
 	return res
 }
 
-func readLogHtml(writer http.ResponseWriter, request *http.Request) {
-	b, err := readFile("webgui/log.html")
-	if err != nil {
-		writer.WriteHeader(http.StatusNotFound)
-		return
-	}
-
-	writer.WriteHeader(http.StatusOK)
-	writer.Write(b)
-}
-
 func (p *XMLRPC) startHTTPServer(user string, password string, protocol string, listenAddr string, s *Supervisor, startedCb func()) {
 	if p.isHTTPServerStartedOnProtocol(protocol) {
 		startedCb()
@@ -149,47 +137,13 @@ func (p *XMLRPC) startHTTPServer(user string, password string, protocol string, 
 	supervisorRestHandler := NewSupervisorRestful(s).CreateSupervisorHandler()
 	mux.Handle("/supervisor/", newHTTPBasicAuth(user, password, supervisorRestHandler))
 
-	// 有bug已弃用
 	logtailHandler := NewLogtail(s).CreateHandler()
 	mux.Handle("/logtail/", newHTTPBasicAuth(user, password, logtailHandler))
 
-	webguiHandler := NewSupervisorWebgui(s).CreateHandler()
-	mux.Handle("/", newHTTPBasicAuth(user, password, webguiHandler))
-
-	// conf 文件
 	confHandler := NewConfApi(s).CreateHandler()
 	mux.Handle("/conf/", newHTTPBasicAuth(user, password, confHandler))
-	mux.HandleFunc("/confFile", func(writer http.ResponseWriter, request *http.Request) {
-		b, err := readFile("webgui/conf.html")
-		if err != nil {
-			writer.WriteHeader(http.StatusNotFound)
-			return
-		}
-
-		writer.WriteHeader(http.StatusOK)
-		writer.Write(b)
-	})
-
-	// 读log.html文件
-	mux.HandleFunc("/log", readLogHtml)
 
 	mux.Handle("/metrics", promhttp.Handler())
-
-	// 注册日志路由,可以查看日志目录
-	entryList := s.config.GetPrograms()
-	for _, c := range entryList {
-		realName := c.GetProgramName()
-		if realName == "" {
-			continue
-		}
-
-		filePath := c.GetString("stdout_logfile", "")
-		if filePath == "" {
-			continue
-		}
-		dir := filepath.Dir(filePath)
-		mux.Handle("/log/"+realName+"/", http.StripPrefix("/log/"+realName+"/", http.FileServer(http.Dir(dir))))
-	}
 
 	listener, err := net.Listen(protocol, listenAddr)
 	if err == nil {

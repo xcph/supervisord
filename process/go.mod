@@ -1,6 +1,6 @@
 module github.com/ochinchina/supervisord/process
 
-go 1.24
+go 1.24.0
 
 require (
 	github.com/mitchellh/go-ps v1.0.0
@@ -30,4 +30,13 @@ require (
 	github.com/rogpeppe/go-charset v0.0.0-20190617161244-0dc95cdf6f31 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
+)
+
+replace (
+	github.com/ochinchina/supervisord/config => ../config
+	github.com/ochinchina/supervisord/events => ../events
+	github.com/ochinchina/supervisord/faults => ../faults
+	github.com/ochinchina/supervisord/logger => ../logger
+	github.com/ochinchina/supervisord/signals => ../signals
+	github.com/ochinchina/supervisord/util => ../util
 )

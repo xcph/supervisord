@@ -44,7 +44,7 @@ func runADBRelay(listenAddr, target string, stop <-chan struct{}) {
 		if err != nil {
 			if !logged {
 				logged = true
-				log.WithFields(log.Fields{"addr": listenAddr, "err": err}).Warn("adb relay waiting for the smolvm gateway address")
+				log.WithFields(log.Fields{"addr": listenAddr, "err": err}).Warn("adb relay waiting for the smolvm address")
 			}
 			select {
 			case <-stop:

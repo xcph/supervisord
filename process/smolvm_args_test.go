@@ -26,32 +26,57 @@ func TestChooseContainerRun(t *testing.T) {
 }
 
 func TestSmolvmRunArgv(t *testing.T) {
-	_, err := smolvmRunArgv("", 2, 2048, "/home/node/.openclaw", []string{"gateway-exec"})
+	_, err := smolvmRunArgv(containerRunSpec{machineName: "app"}, []string{"bin"})
 	if err == nil || !strings.Contains(err.Error(), "CONTAINER_RUN_IMAGE") {
 		t.Fatalf("image: %v", err)
 	}
-	args, err := smolvmRunArgv("registry.example/openclaw:latest", 2, 2048, "/home/node/.openclaw", []string{"/usr/local/bin/gateway-exec", "/usr/local/bin/node", "/app/openclaw.mjs", "gateway"})
+	args, err := smolvmRunArgv(containerRunSpec{
+		image:       "registry.example/app:latest",
+		cpus:        2,
+		mem:         2048,
+		stateDir:    "/var/lib/app",
+		machineName: "my-app",
+		publish:     "127.0.0.1:18889:18889",
+	}, []string{"/usr/local/bin/app-exec", "/usr/local/bin/node", "main.mjs"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	got := strings.Join(args, " ")
 	for _, want := range []string{
 		"smolvm machine run",
-		"--name openclaw-gateway",
+		"--name my-app",
 		"--net-backend virtio-net",
 		"--cpus 2",
 		"--mem 2048",
-		"-v /home/node/.openclaw:/home/node/.openclaw",
+		"-v /var/lib/app:/var/lib/app",
 		"-p 127.0.0.1:18889:18889",
-		"--image registry.example/openclaw:latest",
-		"-- /usr/local/bin/gateway-exec",
+		"--image registry.example/app:latest",
+		"-- /usr/local/bin/app-exec",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %q in %s", want, got)
 		}
 	}
-	resume := strings.Join(smolvmResumeArgv(), " ")
-	if resume != "smolvm machine resume --name openclaw-gateway" {
+	resume := strings.Join(smolvmResumeArgv("my-app"), " ")
+	if resume != "smolvm machine resume --name my-app" {
 		t.Fatal(resume)
+	}
+}
+
+func TestSmolvmRunArgvOmitsEmptyStateDir(t *testing.T) {
+	args, err := smolvmRunArgv(containerRunSpec{
+		image:       "img:1",
+		machineName: "x",
+		publish:     "",
+	}, []string{"cmd"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(args, " ")
+	if strings.Contains(got, "-v ") {
+		t.Fatalf("unexpected volume mount: %s", got)
+	}
+	if strings.Contains(got, "-p ") {
+		t.Fatalf("unexpected publish: %s", got)
 	}
 }

@@ -58,9 +58,9 @@ Please note that config-file location autodetected in this order:
 6. ../supervisord.conf (Relative to the executable)
 
 
-# Run as daemon with web-ui
+# Run as daemon (HTTP API)
 
-Add the inet interface in your configuration:
+Add the inet interface in your configuration (XML-RPC / REST / metrics / ctl; no web UI):
 
 ```ini
 [inet_http_server]
@@ -247,13 +247,9 @@ syslog_stderr_priority=err
 - **syslog_stderr_priority**, can be one of(case insensitive): EMERG, ALERT, CRIT, ERR, WARN, NOTICE, INFO, DEBUG
 
 
-# Web GUI
+# HTTP control plane
 
-Supervisord has builtin web GUI: you can start, stop & check the status of program from the GUI. Following picture shows the default web GUI:
-
-![alt text](https://github.com/ochinchina/supervisord/blob/master/go_supervisord_gui.png)
-
-Please note that in order to see|use Web GUI you should configure it in /etc/supervisord.conf both in [inet_http_server] (and|or [unix_http_server] if you prefer unix domain socket) and [supervisorctl]:
+Configure `[inet_http_server]` (and/or `[unix_http_server]`) plus `[supervisorctl]` so `supervisord ctl` and XML-RPC/REST clients can reach the daemon. There is **no** built-in web UI.
 
 ```ini
 [inet_http_server]
@@ -264,6 +260,8 @@ port=127.0.0.1:9001
 [supervisorctl]
 serverurl=http://127.0.0.1:9001
 ```
+
+Useful endpoints (same auth as above): `/RPC2` (XML-RPC), `/program/…` and `/supervisor/…` (REST), `/logtail/…`, `/conf/…`, `/metrics`.
 
 # Usage from a Docker container
 
@@ -282,7 +280,7 @@ The Prometheus node exporter supported supervisord metrics are now integrated in
 For example, if the port parameter in "inet_http_server" is "127.0.0.1:9001" and then the metrics server should be accessed in url "http://127.0.0.1:9001/metrics" 
 
 
-# Linux: `container_run` process model (OpenClaw fork)
+# Linux: `container_run` process model
 
 When `container_run` is enabled, programs are launched via `__run_container__` (namespaces, optional AppArmor, deferred `setuid`). When disabled, the configured `command` runs as a direct child. Full fork/namespace/AppArmor flow (including `__run_gate_exec__` for non-`/init` targets): **[docs/container-run-process-model.md](docs/container-run-process-model.md)**（中文）.
 

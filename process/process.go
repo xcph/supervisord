@@ -251,11 +251,15 @@ func (p *Process) GetGroup() string {
 	return p.config.Group
 }
 
-// GetDescription returns process status description
+// GetDescription returns process status description for ctl status / XML-RPC.
+// Running: uptime. Terminal / stopping: exit status (and signal), expectedness, stop reason.
 func (p *Process) GetDescription() string {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 	if p.state == Running {
+		if p.cmd == nil || p.cmd.Process == nil {
+			return "running"
+		}
 		seconds := int(time.Now().Sub(p.startTime).Seconds())
 		minutes := seconds / 60
 		hours := minutes / 60
@@ -264,26 +268,47 @@ func (p *Process) GetDescription() string {
 			return fmt.Sprintf("pid %d, uptime %d days, %d:%02d:%02d", p.cmd.Process.Pid, days, hours%24, minutes%60, seconds%60)
 		}
 		return fmt.Sprintf("pid %d, uptime %d:%02d:%02d", p.cmd.Process.Pid, hours%24, minutes%60, seconds%60)
-	} else if p.state != Stopped {
+	}
+
+	var parts []string
+	switch p.state {
+	case Exited, Backoff, Stopped, Fatal, Stopping:
+		if p.cmd != nil && p.cmd.ProcessState != nil {
+			if ws, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok && WaitFinished(ws) {
+				parts = append(parts, FormatExitDescription(ws))
+				code := ReportExitCode(ws)
+				if p.inExitCodes(code) {
+					parts = append(parts, "expected")
+				} else if p.state == Exited || p.state == Backoff || p.state == Fatal {
+					parts = append(parts, "not expected")
+				}
+			}
+		}
+		if p.stopByUser {
+			parts = append(parts, "stopped by user")
+		}
 		if p.stopTime.Unix() > 0 {
-			return p.stopTime.String()
+			parts = append(parts, p.stopTime.UTC().Format(time.RFC3339))
 		}
 	}
-	return ""
+	return strings.Join(parts, "; ")
 }
 
-// GetExitstatus returns exit status of the process if the program exit
+// GetExitstatus returns the shell-style exit code of the process after it has left
+// Running (including Stopping, once Wait has filled ProcessState). Signaled deaths
+// are 128+signal (see ReportExitCode).
 func (p *Process) GetExitstatus() int {
 	p.lock.RLock()
 	defer p.lock.RUnlock()
 
-	if p.state == Exited || p.state == Backoff {
-		if p.cmd.ProcessState == nil {
+	switch p.state {
+	case Exited, Backoff, Stopped, Fatal, Stopping:
+		if p.cmd == nil || p.cmd.ProcessState == nil {
 			return 0
 		}
 		status, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus)
 		if ok {
-			return status.ExitStatus()
+			return ReportExitCode(status)
 		}
 	}
 	return 0
@@ -419,11 +444,11 @@ func (p *Process) inExitCodes(exitCode int) bool {
 }
 
 func (p *Process) getExitCode() (int, error) {
-	if p.cmd.ProcessState == nil {
+	if p.cmd == nil || p.cmd.ProcessState == nil {
 		return -1, fmt.Errorf("no exit code")
 	}
 	if status, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
-		return status.ExitStatus(), nil
+		return ReportExitCode(status), nil
 	}
 
 	return -1, fmt.Errorf("no exit code")
@@ -625,7 +650,14 @@ func (p *Process) waitForExit(startSecs int64) {
 	}
 	_ = cmd.Wait()
 	if cmd.ProcessState != nil {
-		log.WithFields(log.Fields{"program": p.GetName()}).Infof("program stopped with status:%v", cmd.ProcessState)
+		fields := log.Fields{"program": p.GetName(), "status": fmt.Sprintf("%v", cmd.ProcessState)}
+		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+			fields["report_exit"] = ReportExitCode(ws)
+			if ws.Signaled() {
+				fields["signaled"] = ws.Signal().String()
+			}
+		}
+		log.WithFields(fields).Info("program stopped")
 	} else {
 		log.WithFields(log.Fields{"program": p.GetName()}).Info("program stopped")
 	}
@@ -894,17 +926,18 @@ func (p *Process) run(finishCb func()) {
 
 		p.lock.Lock()
 		p.stopADBRelay()
-		if p.launchedSmolvm && gatewayPauseRequested(p.gatewayStateDir()) {
+		runSpec := p.containerRunSpec()
+		if p.launchedSmolvm && containerPauseRequested(runSpec.stateDir, runSpec.pauseFile) {
 			p.stopByUser = true
 			p.launchedSmolvm = false
 			p.changeStateTo(Stopped)
-			log.WithFields(log.Fields{"program": p.GetName()}).Info("openclaw-gateway paused; supervisord will not start it again until resume")
+			log.WithFields(log.Fields{"program": p.GetName()}).Info("program paused via container_run pause file; will not restart until resume")
 			break
 		}
 		if p.launchedSmolvm && p.state != Running && p.state != Stopping && !p.smolvmFallback {
 			p.smolvmFallback = true
-			p.smolvmFallbackReason = "smolvm exited before the gateway was ready"
-			p.writeGatewayRuntime("smolvm", "namespace", p.smolvmFallbackReason)
+			p.smolvmFallbackReason = "smolvm exited before the program was ready"
+			p.writeContainerRuntime(runSpec, "smolvm", "namespace", p.smolvmFallbackReason)
 			p.launchedSmolvm = false
 		}
 
@@ -969,15 +1002,45 @@ func (p *Process) changeStateTo(procState State) {
 		} else if procState == Exited {
 			exitCode, err := p.getExitCode()
 			expected := 0
-			if err == nil && p.inExitCodes(exitCode) {
+			hasExit := err == nil
+			if hasExit && p.inExitCodes(exitCode) {
 				expected = 1
 			}
-			events.EmitEvent(events.CreateProcessExitedEvent(progName, groupName, p.state.String(), expected, p.cmdPid()))
+			fields := log.Fields{
+				"program":  progName,
+				"from":     p.state.String(),
+				"expected": expected == 1,
+			}
+			exitForEvent := 0
+			if hasExit {
+				fields["report_exit"] = exitCode
+				exitForEvent = exitCode
+				if p.cmd != nil && p.cmd.ProcessState != nil {
+					if ws, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+						fields["detail"] = FormatExitDescription(ws)
+					}
+				}
+			}
+			log.WithFields(fields).Info("program state -> Exited")
+			events.EmitEvent(events.CreateProcessExitedEvent(progName, groupName, p.state.String(), expected, p.cmdPid(), exitForEvent, hasExit))
 		} else if procState == Fatal {
+			log.WithFields(log.Fields{"program": progName, "from": p.state.String()}).Error("program state -> Fatal")
 			events.EmitEvent(events.CreateProcessFatalEvent(progName, groupName, p.state.String()))
 		} else if procState == Stopped {
 			// cmd/Process is nil when stop arrives before launch (start_when_file wait).
-			events.EmitEvent(events.CreateProcessStoppedEvent(progName, groupName, p.state.String(), p.cmdPid()))
+			fields := log.Fields{"program": progName, "from": p.state.String(), "stopped_by_user": p.stopByUser}
+			exitCode, exitErr := p.getExitCode()
+			hasExit := exitErr == nil
+			if hasExit {
+				fields["report_exit"] = exitCode
+				if p.cmd != nil && p.cmd.ProcessState != nil {
+					if ws, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+						fields["detail"] = FormatExitDescription(ws)
+					}
+				}
+			}
+			log.WithFields(fields).Info("program state -> Stopped")
+			events.EmitEvent(events.CreateProcessStoppedEvent(progName, groupName, p.state.String(), p.cmdPid(), exitCode, hasExit))
 		} else if procState == Unknown {
 			events.EmitEvent(events.CreateProcessUnknownEvent(progName, groupName, p.state.String()))
 		}
@@ -1035,8 +1098,8 @@ func (p *Process) setEnv() {
 	var base []string
 	if len(env)+len(envFromFiles) != 0 {
 		// envFiles + [program]environment 必须先于 os.Environ 参与 merge：旧顺序把 os 放在前，
-		// 导致 program 中的 HOME= 等无法覆盖 supervisord（root）继承的环境，user=node 子进程仍带
-		// HOME=/root，常见后果是 OpenClaw 读错配置路径后秒退 → supervisord 报 Fatal。
+		// 导致 program 中的 HOME= 等无法覆盖 supervisord（root）继承的环境；user= 降权后的
+		// 子进程仍可能带着 HOME=/root，业务读错配置路径后秒退 → supervisord 报 Fatal。
 		base = mergeKeyValueArrays(append(envFromFiles, env...), os.Environ())
 	} else {
 		base = mergeKeyValueArrays(p.cmd.Env, os.Environ())
@@ -1407,7 +1470,7 @@ func (p *Process) Stop(wait bool, immediate bool) {
 			log.WithFields(log.Fields{"program": p.GetName()}).Info("immediate stop: SIGKILL")
 			if err := p.Signal(syscall.SIGKILL, killasgroup); err != nil {
 				log.WithFields(log.Fields{"program": p.GetName(), "err": err}).Warn(
-					"immediate SIGKILL failed (container may lack CAP_KILL; use cooperative shutdown for openclaw-init)")
+					"immediate SIGKILL failed (container may lack CAP_KILL; configure stop_http_url for cooperative shutdown)")
 			}
 			atomic.StoreInt32(&stopped, 1)
 		}()
@@ -1433,7 +1496,7 @@ func (p *Process) Stop(wait bool, immediate bool) {
 				}
 			}
 			if atomic.LoadInt32(&stopped) == 0 {
-				log.WithFields(log.Fields{"program": p.GetName()}).Info("force to kill the program")
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("force to kill the program (SIGKILL; report_exit expect 137 if Wait sees signaled)")
 				p.Signal(syscall.SIGKILL, killasgroup)
 				killEndTime := time.Now().Add(killwaitsecs)
 				for killEndTime.After(time.Now()) {
@@ -1462,10 +1525,16 @@ func (p *Process) Stop(wait bool, immediate bool) {
 	}
 }
 
-// GetStatus returns status of program as a string
+// GetStatus returns a short process wait summary. Signaled deaths are not
+// reported as "running" (unlike ProcessState.Exited()-only checks).
 func (p *Process) GetStatus() string {
-	if p.cmd.ProcessState == nil {
+	p.lock.RLock()
+	defer p.lock.RUnlock()
+	if p.cmd == nil || p.cmd.ProcessState == nil {
 		return "<nil>"
+	}
+	if ws, ok := p.cmd.ProcessState.Sys().(syscall.WaitStatus); ok && WaitFinished(ws) {
+		return FormatExitDescription(ws)
 	}
 	if p.cmd.ProcessState.Exited() {
 		return p.cmd.ProcessState.String()

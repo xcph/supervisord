@@ -9,7 +9,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jessevdk/go-flags"
 	"github.com/ochinchina/supervisord/config"
@@ -515,19 +517,91 @@ func (x *CtlCommand) showGroupName() bool {
 }
 
 func (x *CtlCommand) showProcessInfo(reply *xmlrpcclient.AllProcessInfoReply, processesMap map[string]bool) {
+	infos := make([]types.ProcessInfo, 0, len(reply.Value))
 	for _, pinfo := range reply.Value {
+		if x.inProcessMap(&pinfo, processesMap) {
+			infos = append(infos, pinfo)
+		}
+	}
+	types.SortProcessInfos(infos)
+	if len(infos) == 0 {
+		fmt.Println("no programs")
+		return
+	}
+
+	nameWidth := 4 // "NAME"
+	for _, pinfo := range infos {
+		processName := pinfo.GetFullName()
+		if !x.showGroupName() {
+			processName = pinfo.Name
+		}
+		if n := len(processName); n > nameWidth {
+			nameWidth = n
+		}
+	}
+	if nameWidth > 48 {
+		nameWidth = 48
+	}
+	if nameWidth < 20 {
+		nameWidth = 20
+	}
+
+	fmt.Printf("%-*s %-10s %8s %6s  %s\n", nameWidth, "NAME", "STATE", "PID", "EXIT", "DESCRIPTION")
+	for _, pinfo := range infos {
 		description := pinfo.Description
 		if strings.ToLower(description) == "<string></string>" {
 			description = ""
 		}
-		if x.inProcessMap(&pinfo, processesMap) {
-			processName := pinfo.GetFullName()
-			if !x.showGroupName() {
-				processName = pinfo.Name
-			}
-			fmt.Printf("%s%-33s%-10s%s%s\n", x.getANSIColor(strings.ToUpper(pinfo.Statename)), processName, pinfo.Statename, description, "\x1b[0m")
+		if x.Verbose {
+			description = x.verboseProcessDescription(&pinfo, description)
 		}
+		processName := pinfo.GetFullName()
+		if !x.showGroupName() {
+			processName = pinfo.Name
+		}
+		if len(processName) > nameWidth {
+			processName = processName[:nameWidth-3] + "..."
+		}
+		state := strings.ToUpper(pinfo.Statename)
+		pidCol := "-"
+		if pinfo.Pid > 0 && (state == "RUNNING" || state == "STARTING" || state == "STOPPING") {
+			pidCol = strconv.Itoa(pinfo.Pid)
+		}
+		exitCol := x.formatExitColumn(state, pinfo.Exitstatus, description)
+		color := x.getANSIColor(state, description)
+		fmt.Printf("%s%-*s %-10s %8s %6s  %s%s\n", color, nameWidth, processName, pinfo.Statename, pidCol, exitCol, description, "\x1b[0m")
 	}
+	fmt.Println(types.SummarizeProcessInfos(infos).Format())
+}
+
+func (x *CtlCommand) formatExitColumn(state string, exitstatus int, description string) string {
+	if state == "RUNNING" || state == "STARTING" {
+		return "-"
+	}
+	desc := strings.ToLower(description)
+	// Never-started STOPPED often has exitstatus 0 with an empty description.
+	if exitstatus == 0 && !strings.Contains(desc, "exit status") && !strings.Contains(desc, "signal") {
+		return "-"
+	}
+	return strconv.Itoa(exitstatus)
+}
+
+func (x *CtlCommand) verboseProcessDescription(pinfo *types.ProcessInfo, base string) string {
+	parts := make([]string, 0, 4)
+	if base != "" {
+		parts = append(parts, base)
+	}
+	if pinfo.Start > 0 {
+		parts = append(parts, "started="+time.Unix(int64(pinfo.Start), 0).UTC().Format(time.RFC3339))
+	}
+	state := strings.ToUpper(pinfo.Statename)
+	if pinfo.Stop > 0 && state != "RUNNING" && state != "STARTING" {
+		parts = append(parts, "stopped="+time.Unix(int64(pinfo.Stop), 0).UTC().Format(time.RFC3339))
+	}
+	if pinfo.Group != "" && pinfo.Group != pinfo.Name {
+		parts = append(parts, "group="+pinfo.Group)
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (x *CtlCommand) inProcessMap(procInfo *types.ProcessInfo, processesMap map[string]bool) bool {
@@ -552,15 +626,25 @@ func (x *CtlCommand) inProcessMap(procInfo *types.ProcessInfo, processesMap map[
 	return false
 }
 
-func (x *CtlCommand) getANSIColor(statename string) string {
-	if statename == "RUNNING" {
-		// green
-		return "\x1b[0;32m"
-	} else if statename == "BACKOFF" || statename == "FATAL" {
-		// red
-		return "\x1b[0;31m"
-	} else {
-		// yellow
+func (x *CtlCommand) getANSIColor(statename, description string) string {
+	desc := strings.ToLower(description)
+	switch statename {
+	case "RUNNING":
+		return "\x1b[0;32m" // green
+	case "STARTING":
+		return "\x1b[0;36m" // cyan
+	case "STOPPING":
+		return "\x1b[0;33m" // yellow
+	case "STOPPED":
+		return "\x1b[0;90m" // bright black / gray
+	case "BACKOFF", "FATAL":
+		return "\x1b[0;31m" // red
+	case "EXITED":
+		if strings.Contains(desc, "not expected") {
+			return "\x1b[0;31m"
+		}
+		return "\x1b[1;33m"
+	default:
 		return "\x1b[1;33m"
 	}
 }

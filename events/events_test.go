@@ -163,22 +163,34 @@ func TestProcessStoppingEvent(t *testing.T) {
 }
 
 func TestProcessExitedEvent(t *testing.T) {
-	event := CreateProcessExitedEvent("proc-1", "group-1", "RUNNING", 1, 2766)
+	event := CreateProcessExitedEvent("proc-1", "group-1", "RUNNING", 1, 2766, 0, true)
 	if event.GetType() != "PROCESS_STATE_EXITED" {
 		t.Error("Fail to creating the process exited event")
 	}
-	if event.GetBody() != "processname:proc-1 groupname:group-1 from_state:RUNNING expected:1 pid:2766" {
-		t.Error("Fail to encode the process exited event")
+	if event.GetBody() != "processname:proc-1 groupname:group-1 from_state:RUNNING expected:1 pid:2766 exitstatus:0" {
+		t.Errorf("Fail to encode the process exited event: %q", event.GetBody())
+	}
+	sigExit := CreateProcessExitedEvent("proc-1", "group-1", "RUNNING", 0, 2766, 137, true)
+	if sigExit.GetBody() != "processname:proc-1 groupname:group-1 from_state:RUNNING expected:0 pid:2766 exitstatus:137" {
+		t.Errorf("signaled exit body: %q", sigExit.GetBody())
+	}
+	noExit := CreateProcessExitedEvent("proc-1", "group-1", "RUNNING", 0, 0, 0, false)
+	if noExit.GetBody() != "processname:proc-1 groupname:group-1 from_state:RUNNING expected:0" {
+		t.Errorf("exited without exitstatus: %q", noExit.GetBody())
 	}
 }
 
 func TestProcessStoppedEvent(t *testing.T) {
-	event := CreateProcessStoppedEvent("proc-1", "group-1", "STOPPING", 2766)
+	event := CreateProcessStoppedEvent("proc-1", "group-1", "STOPPING", 2766, 143, true)
 	if event.GetType() != "PROCESS_STATE_STOPPED" {
 		t.Error("Fail to creating the process stopped event")
 	}
-	if event.GetBody() != "processname:proc-1 groupname:group-1 from_state:STOPPING pid:2766" {
-		t.Error("Fail to encode the process stopped event")
+	if event.GetBody() != "processname:proc-1 groupname:group-1 from_state:STOPPING pid:2766 exitstatus:143" {
+		t.Errorf("Fail to encode the process stopped event: %q", event.GetBody())
+	}
+	noExit := CreateProcessStoppedEvent("proc-1", "group-1", "STOPPING", 0, 0, false)
+	if noExit.GetBody() != "processname:proc-1 groupname:group-1 from_state:STOPPING" {
+		t.Errorf("stopped without exit: %q", noExit.GetBody())
 	}
 }
 
