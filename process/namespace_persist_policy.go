@@ -73,12 +73,14 @@ func (p *Process) spawnPersistedChild() error {
 	if p.keeper == nil {
 		return fmt.Errorf("namespace keeper is not running")
 	}
-	p.keptExit.Store(-1)
 	pid, err := p.keeper.spawn(p.cmd.Args, p.cmd.Env, p.cmd.Dir)
 	if err != nil {
 		return err
 	}
+	// Publish the new pid before clearing the previous exit. An older waiter
+	// must observe this pid and leave it alone.
 	p.keptPid.Store(int32(pid))
+	p.keptExit.Store(-1)
 	return nil
 }
 
@@ -90,8 +92,11 @@ func (p *Process) waitPersistedChild() {
 			code = c
 		}
 	}
-	p.keptExit.Store(int32(code))
-	p.keptPid.Store(0)
+	// A newer spawn may already own keptPid. Clearing it unconditionally
+	// makes that live child look dead and restarts the FATAL loop.
+	if pid > 0 && p.keptPid.CompareAndSwap(int32(pid), 0) {
+		p.keptExit.Store(int32(code))
+	}
 	log.WithFields(log.Fields{"program": p.GetName(), "report_exit": code, "pid": pid}).Info("program stopped")
 	p.lock.Lock()
 	p.stopTime = time.Now()

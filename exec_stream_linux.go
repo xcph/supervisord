@@ -72,8 +72,9 @@ func (t *tunnelServer) ExecStream(stream grpc.BidiStreamingServer[nodeagentv1.Ex
 	if err := t.sup.GetProcessInfo(nil, &struct{ Name string }{Name: hs.ProgramName}, &reply); err != nil {
 		return status.Errorf(codes.NotFound, "program %q: %v", hs.ProgramName, err)
 	}
-	if reply.ProcInfo.Pid == 0 {
-		return status.Errorf(codes.FailedPrecondition, "program %q is not running", hs.ProgramName)
+	targetPid := namespaceExecPid(reply.ProcInfo)
+	if targetPid == 0 {
+		return status.Errorf(codes.FailedPrecondition, "program %q namespace is not running", hs.ProgramName)
 	}
 
 	cmdArgs := append([]string(nil), hs.Argv...)
@@ -90,7 +91,7 @@ func (t *tunnelServer) ExecStream(stream grpc.BidiStreamingServer[nodeagentv1.Ex
 	}
 
 	execInNs := getExecInNsPath()
-	args := append([]string{strconv.Itoa(reply.ProcInfo.Pid)}, cmdArgs...)
+	args := append([]string{strconv.Itoa(targetPid)}, cmdArgs...)
 	cmd := exec.Command(execInNs, args...)
 	var resizePipePath string
 	var resizePipeFile *os.File

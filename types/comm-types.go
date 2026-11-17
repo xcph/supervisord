@@ -20,6 +20,10 @@ type ProcessInfo struct {
 	StdoutLogfile string `xml:"stdout_logfile" json:"stdout_logfile"`
 	StderrLogfile string `xml:"stderr_logfile" json:"stderr_logfile"`
 	Pid           int    `xml:"pid" json:"pid"`
+	// HostPid is the PID in the supervisor's namespace used to join the
+	// program namespace. For a persisted container this is the keeper, not
+	// the namespace-local child pid in Pid.
+	HostPid int `xml:"hostPid" json:"host_pid"`
 }
 
 // ReloadConfigResult the result of supervisor configuration reloading

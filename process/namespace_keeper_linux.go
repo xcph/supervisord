@@ -213,9 +213,35 @@ func (k *NamespaceKeeper) stop() {
 	})
 }
 
+// persistedChildAlive reports whether the program spawned inside the kept
+// namespace is still the current child. keptPid is the PID from ForkExec
+// inside that namespace, so kill(pid, 0) in the supervisor's own namespace
+// looks up a different process: ESRCH makes a live gateway look dead within
+// startsecs, and the next spawn SIGKILLs the namespace. The keeper is the
+// process this supervisor actually started; the child stays current until
+// waitPersistedChild observes its exit and clears keptPid.
 func (p *Process) persistedChildAlive() bool {
-	pid := int(p.keptPid.Load())
-	return pid > 0 && unixPidAlive(pid)
+	if p == nil || p.keeper == nil || !p.keeper.alive() {
+		return false
+	}
+	return p.keptPid.Load() > 0
+}
+
+// NamespaceHostPid is the supervisor-namespace PID to setns into.
+// The keeper is PID 1 of the persisted container namespace, so joining it
+// puts doctor, logs, and a shell in the same PID namespace as the gateway.
+// keptPid is not usable here: it only exists inside that namespace.
+func (p *Process) NamespaceHostPid() int {
+	if p == nil {
+		return 0
+	}
+	if p.keeper != nil && p.keeper.alive() && p.keeper.cmd != nil && p.keeper.cmd.Process != nil {
+		return p.keeper.cmd.Process.Pid
+	}
+	if p.namespaceKept.Load() {
+		return 0
+	}
+	return p.cmdPid()
 }
 
 // StartNamespaceKeeper starts a PID 1 for tests and for a persisted program.

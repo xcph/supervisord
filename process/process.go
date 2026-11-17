@@ -244,7 +244,12 @@ func (p *Process) Start(wait bool) {
 				break
 			}
 		}
-		p.stopNamespaceKeeper()
+		// FATAL leaves the keeper up so a later shell or doctor --fix still
+		// joins the gateway PID namespace. A user stop or an expected exit
+		// that will not restart drops it.
+		if p.GetState() != Fatal {
+			p.stopNamespaceKeeper()
+		}
 		p.lock.Lock()
 		p.inStart = false
 		p.lock.Unlock()

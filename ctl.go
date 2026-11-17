@@ -488,8 +488,9 @@ func (x *CtlCommand) exec(rpcc *xmlrpcclient.XMLRPCClient, args []string, stdinF
 		fmt.Fprintf(os.Stderr, "program '%s' not found\n", program)
 		os.Exit(1)
 	}
-	if procInfo.Pid == 0 {
-		fmt.Fprintf(os.Stderr, "program '%s' is not running (pid=0)\n", program)
+	targetPid := namespaceExecPid(procInfo)
+	if targetPid == 0 {
+		fmt.Fprintf(os.Stderr, "program '%s' namespace is not running\n", program)
 		os.Exit(1)
 	}
 
@@ -521,10 +522,20 @@ func (x *CtlCommand) exec(rpcc *xmlrpcclient.XMLRPCClient, args []string, stdinF
 	if useStdin {
 		stdin = os.Stdin
 	}
-	if err := runExecInNamespace(procInfo.Pid, cmdArgs, stdin, os.Stdout, os.Stderr); err != nil {
+	if err := runExecInNamespace(targetPid, cmdArgs, stdin, os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "exec failed: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// namespaceExecPid is the PID exec-in-ns must setns into. HostPid is the
+// keeper in the supervisor namespace; Pid is only a fallback for a process
+// that was started directly in that namespace.
+func namespaceExecPid(info types.ProcessInfo) int {
+	if info.HostPid > 0 {
+		return info.HostPid
+	}
+	return info.Pid
 }
 
 func (x *CtlCommand) getProcessInfo(rpcc *xmlrpcclient.XMLRPCClient, process string) (types.ProcessInfo, error) {

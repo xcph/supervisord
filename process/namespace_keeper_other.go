@@ -31,3 +31,10 @@ func (k *NamespaceKeeper) alive() bool { return false }
 func MaybeRunNamespaceKeeper([]string) bool { return false }
 
 func (p *Process) persistedChildAlive() bool { return false }
+
+func (p *Process) NamespaceHostPid() int {
+	if p == nil || p.namespaceKept.Load() {
+		return 0
+	}
+	return p.cmdPid()
+}
