@@ -119,6 +119,13 @@ type Process struct {
 	smolvmFallbackReason string
 	launchedSmolvm       bool
 	relayStop            chan struct{}
+	// namespaceKept reuses one PID namespace across restarts of this program.
+	namespaceKept atomic.Bool
+	keptPid       atomic.Int32
+	keptExit      atomic.Int32
+	// explicitRestart asks the start loop to spawn again without destroying the namespace.
+	explicitRestart bool
+	keeper          *NamespaceKeeper
 }
 
 // NewProcess creates new Process object
@@ -132,6 +139,7 @@ func NewProcess(supervisorID string, config *config.Entry) *Process {
 		inStart:    false,
 		stopByUser: false,
 		retryTimes: new(int32)}
+	proc.keptExit.Store(-1)
 	proc.config = config
 	proc.cmd = nil
 	proc.addToCron()
@@ -215,7 +223,19 @@ func (p *Process) Start(wait bool) {
 			if time.Now().Unix()-p.startTime.Unix() < 2 {
 				time.Sleep(5 * time.Second)
 			}
-			if p.stopByUser {
+			p.lock.Lock()
+			explicit := p.explicitRestart
+			p.explicitRestart = false
+			stopped := p.stopByUser
+			p.lock.Unlock()
+			if explicit && !stopped {
+				continue
+			}
+			if p.GetState() == Fatal {
+				log.WithFields(log.Fields{"program": p.GetName()}).Info("program entered Fatal, don't start it again")
+				break
+			}
+			if stopped {
 				log.WithFields(log.Fields{"program": p.GetName()}).Info("program stopped by user, don't start it again")
 				break
 			}
@@ -224,6 +244,7 @@ func (p *Process) Start(wait bool) {
 				break
 			}
 		}
+		p.stopNamespaceKeeper()
 		p.lock.Lock()
 		p.inStart = false
 		p.lock.Unlock()
@@ -322,11 +343,19 @@ func (p *Process) GetPid() int {
 	if p.state == Stopped || p.state == Fatal || p.state == Unknown || p.state == Exited || p.state == Backoff {
 		return 0
 	}
+	if p.namespaceKept.Load() {
+		return int(p.keptPid.Load())
+	}
 	return p.cmdPid()
 }
 
 // cmdPid returns the OS pid, or 0 if the program has not been launched.
 func (p *Process) cmdPid() int {
+	if p.namespaceKept.Load() {
+		if pid := int(p.keptPid.Load()); pid > 0 {
+			return pid
+		}
+	}
 	if p.cmd == nil || p.cmd.Process == nil {
 		return 0
 	}
@@ -444,6 +473,11 @@ func (p *Process) inExitCodes(exitCode int) bool {
 }
 
 func (p *Process) getExitCode() (int, error) {
+	if p.namespaceKept.Load() {
+		if code := p.keptExit.Load(); code >= 0 {
+			return int(code), nil
+		}
+	}
 	if p.cmd == nil || p.cmd.ProcessState == nil {
 		return -1, fmt.Errorf("no exit code")
 	}
@@ -469,6 +503,9 @@ func (p *Process) getExitCodes() []int {
 
 // check if the process is running or not
 func (p *Process) isRunning() bool {
+	if p.namespaceKept.Load() {
+		return p.persistedChildAlive()
+	}
 	if p.cmd != nil && p.cmd.Process != nil {
 		if runtime.GOOS == "windows" {
 			proc, err := ps.FindProcess(p.cmd.Process.Pid)
@@ -529,8 +566,16 @@ func (p *Process) createProgramCommand() error {
 	}
 	programPath := args[0]
 	cr := p.config.GetBool("container_run", false)
+	usePersist := false
 	if cr && !p.prepareSmolvm(&args) {
-		args = createContainerRunWrapper(args)
+		if ok, why := p.persistNamespace(programPath); ok {
+			usePersist = true
+		} else if p.config.GetBool("container_run_persist", false) && why != "container_run_persist is off" && why != "container_run is off" {
+			log.WithFields(log.Fields{"program": p.GetName(), "reason": why}).Info("container_run_persist ignored")
+		}
+		if !usePersist {
+			args = createContainerRunWrapper(args)
+		}
 	}
 	log.WithFields(log.Fields{
 		"program":       p.GetName(),
@@ -547,7 +592,7 @@ func (p *Process) createProgramCommand() error {
 	// 最终 exec 时无法降权到 user= 指定的非 root 用户。
 	p.setProgramRestartChangeMonitor(programPath)
 	setDeathsig(p.cmd.SysProcAttr)
-	if !p.launchedSmolvm {
+	if !p.launchedSmolvm && !usePersist {
 		setContainerRun(p.cmd.SysProcAttr, p.config)
 	}
 	p.setEnv()
@@ -579,8 +624,18 @@ func (p *Process) createProgramCommand() error {
 	}).Debug("createProgramCommand: env flags for container_run / deferred credentials")
 	p.setDir()
 	p.setLog()
+	if usePersist {
+		if err := p.ensureNamespaceKeeper(); err != nil {
+			return err
+		}
+		p.namespaceKept.Store(true)
+	} else {
+		p.namespaceKept.Store(false)
+	}
 
-	p.stdin, _ = p.cmd.StdinPipe()
+	if !usePersist {
+		p.stdin, _ = p.cmd.StdinPipe()
+	}
 	return nil
 
 }
@@ -605,8 +660,7 @@ func (p *Process) setProgramRestartChangeMonitor(programPath string) {
 			} else if len(s) > 0 {
 				p.sendSignals(strings.Fields(s), true)
 			} else {
-				p.Stop(true, false)
-				p.Start(true)
+				p.Restart(true)
 			}
 
 		})
@@ -632,8 +686,7 @@ func (p *Process) setProgramRestartChangeMonitor(programPath string) {
 			} else if len(s) > 0 {
 				p.sendSignals(strings.Fields(s), true)
 			} else {
-				p.Stop(true, false)
-				p.Start(true)
+				p.Restart(true)
 			}
 		})
 	}
@@ -642,6 +695,10 @@ func (p *Process) setProgramRestartChangeMonitor(programPath string) {
 
 // wait for the started program exit
 func (p *Process) waitForExit(startSecs int64) {
+	if p.namespaceKept.Load() {
+		p.waitPersistedChild()
+		return
+	}
 	// Capture cmd at entry: createProgramCommand may replace p.cmd on the next start retry while this
 	// goroutine runs; waiting on the wrong *exec.Cmd leaves the old child orphaned (duplicate PIDs).
 	cmd := p.cmd
@@ -828,10 +885,15 @@ func (p *Process) run(finishCb func()) {
 		}
 
 		// Before fork: join foreground cpuset so child (init) inherits. Fixes redroid ENOSPC.
-		if p.config.GetBool("container_run", false) {
+		// A persisted namespace joins once, when its keeper is created.
+		if p.config.GetBool("container_run", false) && !p.namespaceKept.Load() {
 			joinForegroundCpusetBeforeFork()
 		}
-		err = p.cmd.Start()
+		if p.namespaceKept.Load() {
+			err = p.spawnPersistedChild()
+		} else {
+			err = p.cmd.Start()
+		}
 
 		if err != nil {
 			if p.noteSmolvmStartFailure(err) {
@@ -847,20 +909,26 @@ func (p *Process) run(finishCb func()) {
 				continue
 			}
 		}
-		if p.cmd.Process != nil {
-			log.WithFields(log.Fields{"program": p.GetName(), "pid": p.cmd.Process.Pid, "retry": atomic.LoadInt32(p.retryTimes)}).Debug("program child started")
+		childPid := p.cmdPid()
+		if childPid != 0 {
+			log.WithFields(log.Fields{"program": p.GetName(), "pid": childPid, "retry": atomic.LoadInt32(p.retryTimes)}).Debug("program child started")
 		}
 		if p.StdoutLog != nil {
-			p.StdoutLog.SetPid(p.cmd.Process.Pid)
+			p.StdoutLog.SetPid(childPid)
 		}
 		if p.StderrLog != nil {
-			p.StderrLog.SetPid(p.cmd.Process.Pid)
+			p.StderrLog.SetPid(childPid)
 		}
 
 		// logger.CompositeLogger is not `os.File`, so `cmd.Wait()` will wait for the logger to close
 		// if parent process passes its FD to child process, the logger will not close even when parent process exits
 		// we need to make sure the logger is closed when the process stops running
 		go func() {
+			if p.namespaceKept.Load() {
+				// The keeper inherits these logs for every later child. Closing them
+				// on the first exit would break the next process in the same namespace.
+				return
+			}
 			// the sleep time must be less than `stopwaitsecs`, here I set half of `stopwaitsecs`
 			// otherwise the logger will not be closed before SIGKILL is sent
 			halfWaitsecs := time.Duration(p.config.GetInt("stopwaitsecs", 10)/2) * time.Second
@@ -1082,6 +1150,9 @@ func (p *Process) sendSignals(sigs []string, sigChildren bool) {
 //	sig - the signal to be sent
 //	sigChildren - if true, the signal also will be sent to children processes too
 func (p *Process) sendSignal(sig os.Signal, sigChildren bool) error {
+	if p.namespaceKept.Load() && p.keeper != nil {
+		return p.signalPersistedChild(sig)
+	}
 	if p.cmd != nil && p.cmd.Process != nil {
 		log.WithFields(log.Fields{"program": p.GetName(), "signal": sig}).Info("Send signal to program")
 		err := signals.Kill(p.cmd.Process, sig, sigChildren)

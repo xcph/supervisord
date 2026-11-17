@@ -23,9 +23,9 @@ var validProgramNameForEnvAPI = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$
 
 // putProgramEnvBody PUT /program/{name}/env
 type putProgramEnvBody struct {
-	Merge   *bool             `json:"merge"`
-	Vars    map[string]string `json:"vars"`
-	Remove  []string          `json:"remove"`
+	Merge  *bool             `json:"merge"`
+	Vars   map[string]string `json:"vars"`
+	Remove []string          `json:"remove"`
 }
 
 // patchProgramEnvBody PATCH /program/{name}/env — 单次修改一个键（合并进持久化文件）
@@ -250,13 +250,19 @@ func (sr *SupervisorRestful) respondAfterEnvWrite(w http.ResponseWriter, req *ht
 	wantRestart := req.URL.Query().Get("restart") == "1" || strings.EqualFold(req.URL.Query().Get("restart"), "true")
 	wantImmediateRestart := immediateFromReq(req)
 	if wantRestart {
-		if err := sr.stopProgramForRestart(name, wantImmediateRestart, final); err != nil {
-			reply.Message = "已写入 env，但 stop 失败: " + err.Error()
-			_ = json.NewEncoder(w).Encode(reply)
-			return
+		if wantImmediateRestart {
+			if err := sr.stopProgramForRestart(name, true, final); err != nil {
+				reply.Message = "已写入 env，但 stop 失败: " + err.Error()
+				_ = json.NewEncoder(w).Encode(reply)
+				return
+			}
+			ok, err := sr._startProgram(name)
+			reply.Restarted = ok && err == nil
+		} else {
+			restartReply := struct{ Success bool }{}
+			err := sr.supervisor.RestartProcess(nil, &StartProcessArgs{Name: name, Wait: true}, &restartReply)
+			reply.Restarted = err == nil && restartReply.Success
 		}
-		ok, err := sr._startProgram(name)
-		reply.Restarted = ok && err == nil
 		if !reply.Restarted {
 			reply.Message = "已写入 env，但 restart 失败"
 		} else {

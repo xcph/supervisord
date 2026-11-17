@@ -9,10 +9,10 @@ import (
 
 	"github.com/jhump/grpctunnel"
 	tunnelpb "github.com/jhump/grpctunnel/tunnelpb"
-	nodeagentv1 "github.com/xcph/cloudphone-nodeagent-api/pkg/apiv1"
-	"github.com/xcph/cloudphone-nodeagent-api/pkg/tunnelmeta"
 	"github.com/ochinchina/supervisord/types"
 	log "github.com/sirupsen/logrus"
+	nodeagentv1 "github.com/xcph/cloudphone-nodeagent-api/pkg/apiv1"
+	"github.com/xcph/cloudphone-nodeagent-api/pkg/tunnelmeta"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
@@ -143,15 +143,11 @@ func dispatchSupervise(sup *Supervisor, req *nodeagentv1.SuperviseRequest) (bool
 		}
 		return reply.Success, ""
 	case nodeagentv1.ControlOp_CONTROL_OP_RESTART:
-		stopReply := struct{ Success bool }{false}
-		if err := sup.StopProcess(nil, &StartProcessArgs{Name: req.ProgramName, Wait: true}, &stopReply); err != nil {
+		reply := struct{ Success bool }{false}
+		if err := sup.RestartProcess(nil, &StartProcessArgs{Name: req.ProgramName, Wait: true}, &reply); err != nil {
 			return false, err.Error()
 		}
-		startReply := struct{ Success bool }{false}
-		if err := sup.StartProcess(nil, &StartProcessArgs{Name: req.ProgramName, Wait: true}, &startReply); err != nil {
-			return false, err.Error()
-		}
-		return startReply.Success, ""
+		return reply.Success, ""
 	case nodeagentv1.ControlOp_CONTROL_OP_SIGNAL:
 		reply := struct{ Success bool }{false}
 		err := sup.SignalProcess(nil, &types.ProcessSignal{Name: req.ProgramName, Signal: req.SignalName}, &reply)

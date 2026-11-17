@@ -336,6 +336,24 @@ func (r *XMLRPCClient) GetProcessInfo(process string) (reply types.ProcessInfo, 
 	return
 }
 
+// RestartProcess restarts one program and waits when wait is true.
+func (r *XMLRPCClient) RestartProcess(process string, wait bool) (reply types.BooleanReply, err error) {
+	ins := struct {
+		Name string
+		Wait bool
+	}{
+		Name: process,
+		Wait: wait,
+	}
+	r.post("supervisor.restartProcess", &ins, func(body io.ReadCloser, procError error) {
+		err = procError
+		if err == nil {
+			err = xml.DecodeClientResponse(body, &reply)
+		}
+	})
+	return
+}
+
 // StartProcess Start a process
 func (r *XMLRPCClient) StartProcess(process string, wait bool) (reply types.BooleanReply, err error) {
 	ins := struct {

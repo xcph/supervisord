@@ -60,6 +60,10 @@ killasgroup=true
 # CLONE_NEWPID|CLONE_NEWNS|CLONE_NEWCGROUP|CLONE_NEWUTS|CLONE_NEWIPC, mounts fresh /proc,
 # sets up cpuset for Android. Network ns excluded by default (redroid netd needs iptables).
 container_run=false
+# Keep the PID/mount/UTS/IPC/cgroup namespace until stop, FATAL, or supervisord exit.
+# Autorestart and ctl restart replace only the inner process. Ignored for /init and smolvm.
+# Default off: each start still gets a new namespace.
+container_run_persist=false
 # When true, also use CLONE_NEWNET. Breaks redroid netd/iptables; only for full isolation.
 container_network_isolated=false
 # Linux AppArmor: apply profile on next exec(2) inside container_run (writes /proc/self/attr/exec

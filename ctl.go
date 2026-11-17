@@ -351,8 +351,34 @@ func (x *CtlCommand) _startStopProcesses(rpcc *xmlrpcclient.XMLRPCClient, verb s
 }
 
 func (x *CtlCommand) restartProcesses(rpcc *xmlrpcclient.XMLRPCClient, processes []string) {
-	x._startStopProcesses(rpcc, "stop", processes, "stopped", false)
-	x._startStopProcesses(rpcc, "start", processes, "restarted", true)
+	if len(processes) <= 0 {
+		fmt.Printf("Please specify process for restart\n")
+		return
+	}
+	names := processes
+	if len(processes) == 1 && processes[0] == "all" {
+		reply, err := rpcc.GetAllProcessInfo()
+		if err != nil {
+			fmt.Printf("Fail to list processes: %v\n", err)
+			os.Exit(1)
+		}
+		names = names[:0]
+		for _, info := range reply.Value {
+			names = append(names, info.Name)
+		}
+	}
+	for _, pname := range names {
+		reply, err := rpcc.RestartProcess(pname, true)
+		if err != nil {
+			fmt.Printf("%s: failed [%v]\n", pname, err)
+			os.Exit(1)
+		}
+		if reply.Success {
+			fmt.Printf("%s: restarted\n", pname)
+		} else {
+			fmt.Printf("%s: not restarted\n", pname)
+		}
+	}
 }
 
 // shutdown the supervisord

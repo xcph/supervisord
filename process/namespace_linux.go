@@ -1,11 +1,9 @@
+//go:build linux
 // +build linux
 
 package process
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"syscall"
 
 	"github.com/ochinchina/supervisord/config"
@@ -28,26 +26,6 @@ func setContainerRun(sysProcAttr *syscall.SysProcAttr, entry *config.Entry) {
 	if entry.GetBool("container_network_isolated", false) {
 		sysProcAttr.Cloneflags |= syscall.CLONE_NEWNET
 	}
-}
-
-func getSupervisordPath() string {
-	if p := os.Args[0]; p != "" {
-		if filepath.IsAbs(p) {
-			return p
-		}
-		if abs, err := filepath.Abs(p); err == nil {
-			return abs
-		}
-	}
-	for _, p := range []string{"/shared/supervisord/supervisord", "/usr/local/bin/supervisord"} {
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	if p, err := exec.LookPath("supervisord"); err == nil {
-		return p
-	}
-	return "supervisord"
 }
 
 // createContainerRunWrapper wraps the command to run via supervisord __run_container__.

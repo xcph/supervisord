@@ -39,7 +39,7 @@ type Supervisor struct {
 // StartProcessArgs arguments for starting a process
 type StartProcessArgs struct {
 	Name string // program name
-	Wait bool `default:"true"` // Wait the program starting finished (start); wait for graceful stop/shutdown completion (stop)
+	Wait bool   `default:"true"` // Wait the program starting finished (start); wait for graceful stop/shutdown completion (stop)
 	// Immediate, when StopProcess(N): SIGKILL immediately, skip stopsignal/grace periods; combine with Wait=false to return without waiting for exit (REST ?immediate=true sets both).
 	Immediate bool `default:"false"`
 }
@@ -234,6 +234,20 @@ func (s *Supervisor) GetProcessInfo(r *http.Request, args *struct{ Name string }
 	}
 
 	reply.ProcInfo = *getProcessInfo(proc)
+	return nil
+}
+
+// RestartProcess restarts one program. A persisted container namespace stays up
+// across this restart; a normal program is stopped and started.
+func (s *Supervisor) RestartProcess(r *http.Request, args *StartProcessArgs, reply *struct{ Success bool }) error {
+	procs := s.procMgr.FindMatch(args.Name)
+	if len(procs) <= 0 {
+		return fmt.Errorf("fail to find process %s", args.Name)
+	}
+	for _, proc := range procs {
+		proc.Restart(args.Wait)
+	}
+	reply.Success = true
 	return nil
 }
 

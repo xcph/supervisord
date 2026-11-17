@@ -17,6 +17,7 @@ import (
 	"github.com/ochinchina/go-ini"
 	"github.com/ochinchina/supervisord/config"
 	"github.com/ochinchina/supervisord/logger"
+	"github.com/ochinchina/supervisord/process"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -181,6 +182,9 @@ func getSupervisordLogFile(configFile string) string {
 func main() {
 	if BuildVersion != "" {
 		VERSION = BuildVersion
+	}
+	if process.MaybeRunNamespaceKeeper(os.Args) {
+		return
 	}
 	if handleRunHelper() {
 		return
